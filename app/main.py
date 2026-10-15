@@ -23,6 +23,57 @@ app = FastAPI(title='Timely CRM', version='1.0.0')
 app.add_middleware(CORSMiddleware, allow_origins=['http://localhost:3000', 'http://127.0.0.1:3000', 'http://localhost:8010', 'http://127.0.0.1:8010'], allow_origin_regex=r'https?://.*', allow_credentials=True, allow_methods=['*'], allow_headers=['*'])
 
 
+@app.on_event("startup")
+def startup_db_init():
+    from .db import Base, engine, SessionLocal
+    Base.metadata.create_all(bind=engine)
+    with SessionLocal() as db:
+        org = db.scalar(select(Organization).where(Organization.slug == "timely-health"))
+        if not org:
+            org = Organization(name="Timely Health", slug="timely-health", status="active")
+            db.add(org)
+            db.flush()
+        user = db.scalar(select(User).where(User.email == "admin@timelyhealth.in"))
+        if not user:
+            user = User(
+                name="Administrator",
+                email="admin@timelyhealth.in",
+                password_hash=hash_password("TimelyAdmin2026!"),
+                is_active=True
+            )
+            db.add(user)
+            db.flush()
+        if not db.get(Membership, (org.id, user.id)):
+            db.add(Membership(organization_id=org.id, user_id=user.id, role="admin", status="active"))
+            db.flush()
+        website = db.scalar(select(Website).where(Website.organization_id == org.id, Website.domain == "digital.timelyhealth.in"))
+        if not website:
+            website = Website(
+                organization_id=org.id,
+                name="Timely Health Digital",
+                domain="digital.timelyhealth.in",
+                status="active",
+                config={}
+            )
+            db.add(website)
+            db.flush()
+        key_hash = digest("tly_9Cy-8gtWI2FMMh_GpxLTwfFr5Iav7gY7-cR-1JxnSinXwaFwhc9enQ")
+        key = db.scalar(select(WebsiteKey).where(WebsiteKey.website_id == website.id, WebsiteKey.key_hash == key_hash))
+        if not key:
+            db.add(WebsiteKey(
+                organization_id=org.id,
+                website_id=website.id,
+                key_hash=key_hash
+            ))
+        db.commit()
+
+
+@app.get('/api/v1/public/init-db')
+def manual_init_db():
+    startup_db_init()
+    return {'status': 'ok', 'message': 'Database initialized successfully'}
+
+
 @app.exception_handler(RequestValidationError)
 async def validation_error(request, error):
     # Never reflect passwords or arbitrary uploaded contact data in errors.
