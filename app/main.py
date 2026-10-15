@@ -1,3 +1,4 @@
+import asyncio
 import csv
 import io
 import json
@@ -5,6 +6,7 @@ import os
 import secrets
 from datetime import datetime, timedelta, timezone
 
+import httpx
 from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Request, Response, UploadFile
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
@@ -66,6 +68,46 @@ def startup_db_init():
                 key_hash=key_hash
             ))
         db.commit()
+    asyncio.create_task(sync_website_leads_loop())
+
+
+async def sync_website_leads_loop():
+    await asyncio.sleep(2)
+    while True:
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                res = await client.get('https://api.timelyhealth.in/api/consultation-leads?limit=50')
+                if res.status_code == 200:
+                    data = res.json().get('data', [])
+                    from .db import SessionLocal
+                    with SessionLocal() as db:
+                        org = db.scalar(select(Organization).where(Organization.slug == 'timely-health'))
+                        website = db.scalar(select(Website).where(Website.domain == 'digital.timelyhealth.in'))
+                        if org and website:
+                            for item in data:
+                                ext_id = f"timely-consultation:{item['_id']}"
+                                existing = db.scalar(select(Lead).where(
+                                    Lead.organization_id == org.id,
+                                    Lead.external_submission_id == ext_id
+                                ))
+                                if not existing:
+                                    lead_input = LeadInput(
+                                        full_name=item.get('name') or 'Website Lead',
+                                        email=item.get('email') or '',
+                                        phone=item.get('phone') or '',
+                                        company_name=item.get('businessName') or '',
+                                        inquiry_type=item.get('lookingFor') or 'Digital consultation',
+                                        website_id=website.id
+                                    )
+                                    attribution = {
+                                        'business_type': item.get('businessType') or '',
+                                        'form_id': 'timely-digital-consultation'
+                                    }
+                                    create_lead(db, org.id, lead_input, 'website', external_id=ext_id, attribution=attribution)
+                            db.commit()
+        except Exception:
+            pass
+        await asyncio.sleep(8)
 
 
 @app.get('/api/v1/public/init-db')
