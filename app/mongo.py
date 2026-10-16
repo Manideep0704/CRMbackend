@@ -127,9 +127,11 @@ def authenticate_attendance_user(identifier: str, password: str):
         })
         if admin and str(admin.get('password')) == str(password):
             return {
+                '_id': str(admin.get('_id', '')),
                 'email': (admin.get('email') or f'{ident}@timelyhealth.in').lower(),
                 'name': admin.get('name') or 'Admin',
-                'role': 'admin'
+                'role': 'admin',
+                'entitled_org_slug': 'timely-health'
             }
 
         # 2. Check 'employees' collection
@@ -155,10 +157,12 @@ def authenticate_attendance_user(identifier: str, password: str):
             else:
                 crm_role = 'viewer' # Only sales department persons become agents!
             return {
+                '_id': str(emp.get('_id', '')),
                 'email': (emp.get('email') or f'{ident}@timelyhealth.in').lower(),
                 'name': emp.get('name') or 'Employee',
                 'role': crm_role,
-                'status': emp_status
+                'status': emp_status,
+                'entitled_org_slug': 'timely-health'
             }
 
         # 3. Check 'empls' collection
@@ -177,39 +181,49 @@ def authenticate_attendance_user(identifier: str, password: str):
             empl_email = str(empl.get('email', '')).lower()
             crm_role = 'agent' if ('sales' in empl_dept or 'manideepreddy2477@gmail.com' in empl_email) else 'viewer'
             return {
+                '_id': str(empl.get('_id', '')),
                 'email': (empl.get('email') or f'{ident}@timelyhealth.in').lower(),
                 'name': empl.get('name') or 'Employee',
                 'role': crm_role,
-                'status': empl_status
+                'status': empl_status,
+                'entitled_org_slug': 'timely-health'
             }
     except Exception as e:
         print(f"[MongoDB Auth] Error checking attendanceDB user: {e}")
     return None
 
 
-def is_attendance_user(identifier: str) -> bool:
+def check_attendance_user_status(identifier: str) -> tuple[bool, bool]:
     """
-    S3 – Checks if an identifier (email, phone, employeeId) exists in attendanceDB (MongoDB).
-    Used to distinguish federated accounts from local accounts so local password fallback
-    is disabled for federated users.
+    S3/S4 – Checks if an identifier (email, phone, employeeId) exists in attendanceDB,
+    and whether the directory is reachable.
+    Returns: (is_present: bool, provider_available: bool)
     """
     db_mongo = get_mongo_db()
-    if db_mongo is None or not identifier:
-        return False
+    if db_mongo is None:
+        return False, False
     try:
         import re
         ident = identifier.strip()
         ident_pattern = {'$regex': f'^{re.escape(ident)}$', '$options': 'i'}
         if db_mongo['admins'].find_one({'$or': [{'email': ident_pattern}, {'mobile': ident}, {'name': ident_pattern}]}, {'_id': 1}):
-            return True
+            return True, True
         if db_mongo['employees'].find_one({'$or': [{'email': ident_pattern}, {'employeeId': ident_pattern}, {'phone': ident}]}, {'_id': 1}):
-            return True
+            return True, True
         if db_mongo['empls'].find_one({'$or': [{'email': ident_pattern}, {'phone': ident}]}, {'_id': 1}):
-            return True
-        return False
+            return True, True
+        return False, True
     except Exception as e:
         print(f"[MongoDB] Error checking attendance user: {e}")
-        return False
+        return False, False
+
+
+def is_attendance_user(identifier: str) -> bool:
+    """
+    S3 – Compatibility wrapper returning whether identifier is in attendanceDB.
+    """
+    present, _ = check_attendance_user_status(identifier)
+    return present
 
 
 def sync_sales_agents_from_mongo():
@@ -224,7 +238,7 @@ def sync_sales_agents_from_mongo():
 
     try:
         from .models import User, Membership, Organization, Lead
-        from .security import hash_password
+        from .security import hash_password, revoke_user_sessions
 
         # Query ONLY active sales employees from attendanceDB
         active_sales_emps = list(db_mongo['employees'].find({
@@ -261,19 +275,23 @@ def sync_sales_agents_from_mongo():
                     continue
                 active_sales_emails.add(email)
                 name = (emp.get('name') or 'Sales Agent').strip()
-                # S3 – Never use a shared/guessable fallback. Generate a unique
-                # random secret so the local hash is never a viable login credential.
-                # Federated users must always authenticate via MongoDB.
+                # S3 – Never copy upstream plaintext or hashed passwords into CRM local database.
+                # Always generate an unguessable random secret so local login is impossible.
+                # Federated accounts must authenticate exclusively against attendanceDB.
                 import secrets as _sec
-                pwd = emp.get('password') or _sec.token_urlsafe(32)
+                random_hash = hash_password(_sec.token_urlsafe(32))
+                subject_id = str(emp.get('_id', ''))
 
                 user = db_crm.scalar(select(User).where(User.email == email))
                 if not user:
                     user = User(
                         name=name,
                         email=email,
-                        password_hash=hash_password(pwd),
-                        is_active=True
+                        password_hash=random_hash,
+                        is_active=True,
+                        auth_provider='attendance',
+                        auth_subject=subject_id,
+                        token_version=1
                     )
                     db_crm.add(user)
                     db_crm.flush()
@@ -281,6 +299,10 @@ def sync_sales_agents_from_mongo():
                     if name and not user.name:
                         user.name = name
                     user.is_active = True
+                    user.auth_provider = 'attendance'
+                    user.auth_subject = subject_id
+                    # Overwrite any legacy cached password hash with random unguessable secret
+                    user.password_hash = random_hash
                     db_crm.flush()
 
                 membership = db_crm.get(Membership, (org.id, user.id))
@@ -298,20 +320,21 @@ def sync_sales_agents_from_mongo():
                 db_crm.flush()
 
             # For any inactive sales employees:
-            # Unassign any leads held by inactive users and remove their CRM membership
+            # Mark membership inactive, revoke all active sessions, and unassign leads
             for inact_email in inactive_sales_emails:
                 u = db_crm.scalar(select(User).where(User.email == inact_email))
                 if u:
                     u.is_active = False
-                    assigned_leads = db_crm.scalars(select(Lead).where(Lead.assigned_to == u.id)).all()
+                    # S5 – Revoke all sessions for deactivated user
+                    revoke_user_sessions(db_crm, u.id)
+                    assigned_leads = db_crm.scalars(select(Lead).where(Lead.organization_id == org.id, Lead.assigned_to == u.id)).all()
                     for l in assigned_leads:
                         l.assigned_to = None
-                    db_crm.flush()
-
                     m = db_crm.get(Membership, (org.id, u.id))
                     if m:
-                        db_crm.delete(m)
-                        print(f"[Sales Sync] Removed inactive sales employee {u.name} ({u.email}) from CRM members.")
+                        m.status = 'inactive'
+                    db_crm.flush()
+                    print(f"[Sales Sync] Deactivated inactive sales employee {u.name} ({u.email}) and revoked sessions.")
 
             # Ensure any other non-active-sales users currently marked as 'agent' are downgraded to 'viewer'
             memberships = db_crm.scalars(

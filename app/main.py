@@ -41,33 +41,12 @@ app.add_middleware(
 @app.on_event("startup")
 def startup_db_init():
     from .db import Base, engine, SessionLocal
-    from sqlalchemy import text
     Base.metadata.create_all(bind=engine)
-    with engine.connect() as conn:
-        for col, col_type in [('accepted_by', 'VARCHAR(36)'), ('accepted_at', 'DATETIME')]:
-            try:
-                conn.execute(text(f"ALTER TABLE leads ADD COLUMN {col} {col_type}"))
-                conn.commit()
-            except Exception:
-                pass
     with SessionLocal() as db:
         org = db.scalar(select(Organization).where(Organization.slug == "timely-health"))
         if not org:
             org = Organization(name="Timely Health", slug="timely-health", status="active")
             db.add(org)
-            db.flush()
-        user = db.scalar(select(User).where(User.email == "admin@timelyhealth.in"))
-        if not user:
-            user = User(
-                name="Administrator",
-                email="admin@timelyhealth.in",
-                password_hash=hash_password("TimelyAdmin2026!"),
-                is_active=True
-            )
-            db.add(user)
-            db.flush()
-        if not db.get(Membership, (org.id, user.id)):
-            db.add(Membership(organization_id=org.id, user_id=user.id, role="admin", status="active"))
             db.flush()
         website = db.scalar(select(Website).where(Website.organization_id == org.id, Website.domain == "digital.timelyhealth.in"))
         if not website:
@@ -80,14 +59,38 @@ def startup_db_init():
             )
             db.add(website)
             db.flush()
-        key_hash = digest("tly_9Cy-8gtWI2FMMh_GpxLTwfFr5Iav7gY7-cR-1JxnSinXwaFwhc9enQ")
-        key = db.scalar(select(WebsiteKey).where(WebsiteKey.website_id == website.id, WebsiteKey.key_hash == key_hash))
-        if not key:
-            db.add(WebsiteKey(
-                organization_id=org.id,
-                website_id=website.id,
-                key_hash=key_hash
-            ))
+
+        # Controlled initial administrator provisioning via environment variables only (S1)
+        init_admin_email = os.getenv("INITIAL_ADMIN_EMAIL")
+        init_admin_pass = os.getenv("INITIAL_ADMIN_PASSWORD")
+        if init_admin_email and init_admin_pass:
+            user = db.scalar(select(User).where(User.email == init_admin_email.lower()))
+            if not user:
+                user = User(
+                    name="Administrator",
+                    email=init_admin_email.lower(),
+                    password_hash=hash_password(init_admin_pass),
+                    is_active=True,
+                    auth_provider='local',
+                    token_version=1
+                )
+                db.add(user)
+                db.flush()
+            if not db.get(Membership, (org.id, user.id)):
+                db.add(Membership(organization_id=org.id, user_id=user.id, role="admin", status="active"))
+                db.flush()
+
+        # Controlled initial website API key provisioning via environment variable only (S1)
+        init_key = os.getenv("INITIAL_WEBSITE_KEY")
+        if init_key and website:
+            key_hash = digest(init_key)
+            key = db.scalar(select(WebsiteKey).where(WebsiteKey.website_id == website.id, WebsiteKey.key_hash == key_hash))
+            if not key:
+                db.add(WebsiteKey(
+                    organization_id=org.id,
+                    website_id=website.id,
+                    key_hash=key_hash
+                ))
         db.commit()
     try:
         from .mongo import sync_sales_agents_from_mongo
@@ -218,48 +221,65 @@ def login(payload: Login, request: Request, response: Response, db=Depends(get_d
     user = db.scalar(select(User).where(User.email == payload.email.lower()))
 
     # S3 – Distinguish local vs federated accounts.
-    # If the user exists in attendanceDB (MongoDB), they are a federated user.
-    # Local password fallback is completely disabled for federated users:
-    # upstream password changes and deactivations take effect immediately.
-    from .mongo import authenticate_attendance_user, is_attendance_user
-    is_federated = is_attendance_user(payload.email)
-    mongo_user = None
+    # Persist auth_provider: if account is federated ('attendance'), authentication MUST delegate to Mongo.
+    # Provider error/absence MUST fail closed (never fall back to local password).
+    from .mongo import authenticate_attendance_user, check_attendance_user_status
+    is_federated = bool(user and getattr(user, 'auth_provider', None) == 'attendance')
+    exists_in_dir, provider_ok = check_attendance_user_status(payload.email)
+    if not is_federated and exists_in_dir:
+        is_federated = True
 
+    mongo_user = None
     if is_federated:
+        if not provider_ok:
+            # S3 – Directory outage must NEVER fall back to local auth; fail closed.
+            raise HTTPException(503, 'External authentication provider is temporarily unavailable. Please try again later.')
         mongo_user = authenticate_attendance_user(payload.email, payload.password)
         valid = mongo_user is not None
-        if not valid and user:
-            # S3 – Upstream auth failed (e.g. inactive or revoked). Invalidate local active flag.
-            user.is_active = False
-            db.commit()
+        # S3 – Wrong password does NOT globally disable user! Only invalidates this attempt.
     else:
-        # Local account: verify against local scrypt hash
+        # Strictly local account: only verify against local scrypt hash if NOT federated
         valid = verify_password(payload.password, user.password_hash if user else DUMMY_PASSWORD)
 
     if mongo_user:
-        user = db.scalar(select(User).where(User.email == mongo_user['email']))
+        user = db.scalar(select(User).where(User.email == mongo_user['email'].lower()))
         if not user:
             user = User(
                 name=mongo_user['name'],
-                email=mongo_user['email'],
+                email=mongo_user['email'].lower(),
                 # S3 – Random unguessable hash for federated users; auth is always delegated to Mongo
                 password_hash=hash_password(secrets.token_urlsafe(32)),
-                is_active=True
+                is_active=True,
+                auth_provider='attendance',
+                auth_subject=str(mongo_user.get('_id', '')),
+                token_version=1
             )
             db.add(user)
             db.flush()
         else:
             user.is_active = True
+            user.auth_provider = 'attendance'
+            if mongo_user.get('_id'):
+                user.auth_subject = str(mongo_user['_id'])
+            # S3 – Overwrite any legacy password hash with random unguessable secret
+            user.password_hash = hash_password(secrets.token_urlsafe(32))
             if mongo_user.get('name') and not user.name:
                 user.name = mongo_user['name']
             db.flush()
 
+        # S2 – Check organization entitlement!
+        # An attendance identity is ONLY entitled to their designated organization (e.g. 'timely-health').
+        # Cross-tenant auto-provisioning into arbitrary requested organizations is strictly forbidden.
+        entitled_slug = mongo_user.get('entitled_org_slug', 'timely-health')
         membership_check = db.get(Membership, (org.id, user.id))
-        allowed_roles = {'admin', 'agent', 'viewer'}
-        raw_role = mongo_user.get('role', 'viewer')
-        safe_role = raw_role if raw_role in allowed_roles else 'viewer'
         if not membership_check:
-            # S2 – Only provision membership for roles in the explicit allowlist
+            # Deny provisioning in unentitled organizations
+            if org.slug != entitled_slug:
+                raise HTTPException(401, 'Invalid email, password or organization')
+
+            allowed_roles = {'admin', 'agent', 'viewer'}
+            raw_role = mongo_user.get('role', 'viewer')
+            safe_role = raw_role if raw_role in allowed_roles else 'viewer'
             membership_check = Membership(
                 organization_id=org.id,
                 user_id=user.id,
@@ -269,9 +289,14 @@ def login(payload: Login, request: Request, response: Response, db=Depends(get_d
             db.add(membership_check)
             db.flush()
         else:
-            if membership_check.role != safe_role:
-                membership_check.role = safe_role
-                db.flush()
+            if membership_check.status != 'active':
+                raise HTTPException(403, 'Organization access is inactive')
+            if org.slug == entitled_slug and mongo_user.get('role'):
+                allowed_roles = {'admin', 'agent', 'viewer'}
+                raw_role = mongo_user.get('role', membership_check.role)
+                if raw_role in allowed_roles:
+                    membership_check.role = raw_role
+                    db.flush()
         valid = True
 
     membership = db.get(Membership, (org.id, user.id)) if org and user else None
@@ -295,6 +320,15 @@ def logout(request: Request, response: Response, ctx=Depends(context), db=Depend
     db.commit()
     response.delete_cookie('timely_session', path='/')
     return {'ok': True}
+
+
+@app.post('/api/v1/auth/revoke-all')
+def revoke_all(response: Response, ctx=Depends(context), db=Depends(get_db)):
+    # S5 – Revoke all active sessions for current user
+    revoke_user_sessions(db, ctx['user_id'])
+    db.commit()
+    response.delete_cookie('timely_session', path='/')
+    return {'ok': True, 'message': 'All active sessions revoked'}
 
 
 @app.get('/api/v1/organizations/me')
@@ -396,18 +430,61 @@ def lead_query(ctx, q='', status='', website_id='', source='', assigned_to='', d
 
 
 @app.get('/api/v1/leads')
-def leads(q: str = '', status: str = '', website_id: str = '', source: str = '', assigned_to: str = '', pipeline: bool = False, date_from: datetime | None = None, date_to: datetime | None = None, page: int = 1, page_size: int = 20, sort: str = 'newest', ctx=Depends(context), db=Depends(get_db)):
+def leads(q: str = '', status: str = '', website_id: str = '', source: str = '', assigned_to: str = '', unclaimed: bool = False, pipeline: bool = False, date_from: datetime | None = None, date_to: datetime | None = None, page: int = 1, page_size: int = 20, sort: str = 'newest', ctx=Depends(context), db=Depends(get_db)):
     if page < 1 or not 1 <= page_size <= 100:
         raise HTTPException(422, 'Invalid pagination')
-    # S4 – agent scope applied always, not just in pipeline mode.
-    # agent_scope() returns the agent's own user_id; admin/viewer get None (no restriction).
-    eff_assigned_to = agent_scope(ctx) or assigned_to
-    query = lead_query(ctx, q, status, website_id, source, eff_assigned_to, date_from, date_to)
+    if unclaimed:
+        # S4 – Unclaimed shared queue: leads awaiting claim/acceptance across the tenant
+        query = select(Lead).where(
+            Lead.organization_id == ctx['organization_id'],
+            Lead.deleted_at.is_(None),
+            Lead.accepted_by.is_(None)
+        )
+        if q:
+            pattern = '%' + q.replace('\\', '\\\\').replace('%', '\\%').replace('_', '\\_') + '%'
+            query = query.where(or_(*[column.ilike(pattern, escape='\\') for column in [Lead.full_name, Lead.email, Lead.phone, Lead.company_name]]))
+        for column, value in [(Lead.status, status), (Lead.website_id, website_id), (Lead.source, source)]:
+            if value:
+                query = query.where(column == value)
+        if date_from:
+            if date_from.tzinfo is None:
+                raise HTTPException(422, 'Date filters must include a timezone')
+            query = query.where(Lead.created_at >= date_from.astimezone(timezone.utc))
+        if date_to:
+            if date_to.tzinfo is None:
+                raise HTTPException(422, 'Date filters must include a timezone')
+            query = query.where(Lead.created_at <= date_to.astimezone(timezone.utc))
+    else:
+        # S4 – agent scope applied always, not just in pipeline mode.
+        # agent_scope() returns the agent's own user_id; admin/viewer get None (no restriction).
+        eff_assigned_to = agent_scope(ctx) or assigned_to
+        query = lead_query(ctx, q, status, website_id, source, eff_assigned_to, date_from, date_to)
+
     count = db.scalar(select(func.count()).select_from(query.subquery()))
     order = {'newest': Lead.created_at.desc(), 'oldest': Lead.created_at.asc(), 'name': Lead.full_name.asc()}.get(sort)
     if order is None:
         raise HTTPException(422, 'Sort must be newest, oldest or name')
     return {'items': [serialize(l) for l in db.scalars(query.order_by(order, Lead.id).offset((page - 1) * page_size).limit(page_size))], 'total': count, 'page': page, 'page_size': page_size}
+
+
+@app.get('/api/v1/leads/queue')
+def leads_queue(q: str = '', status: str = '', website_id: str = '', source: str = '', page: int = 1, page_size: int = 20, sort: str = 'newest', ctx=Depends(context), db=Depends(get_db)):
+    """
+    S4 – Dedicated paginated claim inbox for unaccepted leads awaiting assignment.
+    Accessible to all active tenant members (agents & admins).
+    """
+    return leads(
+        q=q,
+        status=status,
+        website_id=website_id,
+        source=source,
+        unclaimed=True,
+        page=page,
+        page_size=page_size,
+        sort=sort,
+        ctx=ctx,
+        db=db
+    )
 
 
 @app.post('/api/v1/leads', status_code=201)

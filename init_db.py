@@ -8,10 +8,13 @@ from app.db import SessionLocal
 from app.models import Organization, User, Membership, Website, WebsiteKey
 from app.security import hash_password, digest
 
-WEBSITE_KEY = "tly_9Cy-8gtWI2FMMh_GpxLTwfFr5Iav7gY7-cR-1JxnSinXwaFwhc9enQ"
-ADMIN_EMAIL = "admin@timelyhealth.in"
-ADMIN_PASS  = "TimelyAdmin2026!"
-DOMAIN      = "digital.timelyhealth.in"
+import os
+import secrets
+
+ADMIN_EMAIL = os.getenv("ADMIN_EMAIL", "admin@timelyhealth.in")
+ADMIN_PASS  = os.getenv("ADMIN_PASS") or secrets.token_urlsafe(16)
+WEBSITE_KEY = os.getenv("WEBSITE_KEY") or f"tly_{secrets.token_urlsafe(32)}"
+DOMAIN      = os.getenv("DOMAIN", "digital.timelyhealth.in")
 
 def run_migrations():
     print("[1/3] Running database migrations (alembic upgrade head)...")

@@ -19,6 +19,14 @@ class User(Base):
     email: Mapped[str] = mapped_column(String(254), unique=True)
     password_hash: Mapped[str] = mapped_column(Text)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+    # S3/S4 – Federated identity: persisted so provider absence never falls back to local auth.
+    # auth_provider: 'local' | 'attendance'  (NULL treated as 'local' for legacy rows)
+    auth_provider: Mapped[str | None] = mapped_column(String(40), nullable=True, default=None)
+    # auth_subject: stable external subject ID (e.g. MongoDB _id hex string)
+    auth_subject: Mapped[str | None] = mapped_column(String(160), nullable=True, default=None, index=True)
+    # S5 – Session revocation & token versioning
+    token_version: Mapped[int] = mapped_column(Integer, default=1)
+    sessions_revoked_at: Mapped[object | None] = mapped_column(DateTime(timezone=True), nullable=True, default=None)
 
 
 class Membership(Base):
@@ -36,6 +44,8 @@ class AuthSession(Base):
     user_id: Mapped[str] = mapped_column(ForeignKey('users.id'))
     organization_id: Mapped[str] = mapped_column(ForeignKey('organizations.id'))
     expires_at: Mapped[object] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[object] = mapped_column(DateTime(timezone=True), default=now)
+    token_version: Mapped[int] = mapped_column(Integer, default=1)
     __table_args__ = (ForeignKeyConstraint(['organization_id', 'user_id'], ['organization_memberships.organization_id', 'organization_memberships.user_id']),)
 
 

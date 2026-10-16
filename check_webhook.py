@@ -1,12 +1,19 @@
+import os
 import httpx
 import uuid
 
-URL = 'https://crmbackend.iryax.com/api/v1/public/leads'
-API_KEY = 'tly_9Cy-8gtWI2FMMh_GpxLTwfFr5Iav7gY7-cR-1JxnSinXwaFwhc9enQ'
+URL = os.getenv('CRM_WEBHOOK_URL', 'https://crmbackend.iryax.com/api/v1/public/leads')
+API_KEY = os.getenv('CRM_API_KEY', '')
+ADMIN_EMAIL = os.getenv('ADMIN_EMAIL', 'admin@timelyhealth.in')
+ADMIN_PASS = os.getenv('ADMIN_PASS', '')
 
 print("====================================================")
 print("        WEBHOOK SUITE VERIFICATION REPORT           ")
 print("====================================================")
+
+if not API_KEY or not ADMIN_PASS:
+    print("[SKIP] CRM_API_KEY and ADMIN_PASS environment variables must be provided to run live webhook test.")
+    exit(0)
 
 sub_id = f"webhook-test-{uuid.uuid4().hex[:8]}"
 payload = {
@@ -49,8 +56,8 @@ with httpx.Client(timeout=10.0) as client:
 
     # 6. Verify in CRM Dashboard (Login & Query)
     login = client.post("https://crmbackend.iryax.com/api/v1/auth/login", json={
-        "email": "admin@timelyhealth.in",
-        "password": "TimelyAdmin2026!",
+        "email": ADMIN_EMAIL,
+        "password": ADMIN_PASS,
         "organization_slug": "timely-health"
     }, headers={"X-Timely-Request": "1"})
     cookie = login.cookies.get("timely_session")

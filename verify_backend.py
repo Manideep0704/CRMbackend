@@ -1,9 +1,17 @@
+import os
 import httpx
+
+ADMIN_EMAIL = os.getenv('ADMIN_EMAIL', 'admin@timelyhealth.in')
+ADMIN_PASS = os.getenv('ADMIN_PASS', '')
+API_KEY = os.getenv('WEBSITE_KEY', '')
 
 def test_production():
     print("==================================================================")
     print(" 1. AUDITING LIVE PRODUCTION BACKEND (https://crmbackend.iryax.com)")
     print("==================================================================")
+    if not ADMIN_PASS or not API_KEY:
+        print("  [SKIP] ADMIN_PASS and WEBSITE_KEY environment variables required for live verification.")
+        return
     try:
         with httpx.Client(base_url='https://crmbackend.iryax.com', timeout=10.0) as client:
             # 1. Health
@@ -12,8 +20,8 @@ def test_production():
 
             # 2. Login
             login_res = client.post('/api/v1/auth/login', json={
-                'email': 'admin@timelyhealth.in',
-                'password': 'TimelyAdmin2026!',
+                'email': ADMIN_EMAIL,
+                'password': ADMIN_PASS,
                 'organization_slug': 'timely-health'
             }, headers={'X-Timely-Request': '1'})
             print(f"  [PASS] Authentication (Login): HTTP {login_res.status_code}")
@@ -57,7 +65,7 @@ def test_production():
                 'inquiry_type': 'Audit check',
                 'external_submission_id': 'audit-verification-sub-001'
             }, headers={
-                'X-API-Key': 'tly_9Cy-8gtWI2FMMh_GpxLTwfFr5Iav7gY7-cR-1JxnSinXwaFwhc9enQ'
+                'X-API-Key': API_KEY
             })
             print(f"  [PASS] Public Lead Ingest Webhook: HTTP {webhook_res.status_code} -> {webhook_res.json()}")
 
@@ -72,14 +80,17 @@ def test_local():
     print("\n==================================================================")
     print(" 2. AUDITING LOCAL BACKEND (http://127.0.0.1:8010)")
     print("==================================================================")
+    if not ADMIN_PASS:
+        print("  [SKIP] ADMIN_PASS environment variable required for local login check.")
+        return
     try:
         with httpx.Client(base_url='http://127.0.0.1:8010', timeout=5.0) as client:
             r = client.get('/health')
             print(f"  [PASS] Local Health: HTTP {r.status_code} -> {r.json()}")
 
             login_res = client.post('/api/v1/auth/login', json={
-                'email': 'admin@timelyhealth.in',
-                'password': 'TimelyAdmin2026!',
+                'email': ADMIN_EMAIL,
+                'password': ADMIN_PASS,
                 'organization_slug': 'timely-health'
             }, headers={'X-Timely-Request': '1'})
             print(f"  [PASS] Local Auth Login: HTTP {login_res.status_code}")

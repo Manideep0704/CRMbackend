@@ -57,20 +57,43 @@ DUMMY_PASSWORD = hash_password(secrets.token_urlsafe(24))
 
 def new_session(db, user, organization_id):
     token = secrets.token_urlsafe(48)
-    db.add(AuthSession(token_hash=digest(token), user_id=user.id, organization_id=organization_id, expires_at=now() + timedelta(hours=12)))
+    db.add(AuthSession(
+        token_hash=digest(token),
+        user_id=user.id,
+        organization_id=organization_id,
+        expires_at=now() + timedelta(hours=12),
+        created_at=now(),
+        token_version=getattr(user, 'token_version', 1) or 1
+    ))
     return token
+
+
+def revoke_user_sessions(db, user_id: str):
+    """
+    S5 – Permanently revokes all active sessions for a user.
+    Deletes session records and increments user token_version so old tokens
+    cannot be revived even if the account is later re-enabled.
+    """
+    from sqlalchemy import delete
+    user = db.get(User, user_id)
+    if user:
+        user.token_version = (getattr(user, 'token_version', 1) or 1) + 1
+        user.sessions_revoked_at = now()
+    db.execute(delete(AuthSession).where(AuthSession.user_id == user_id))
+    db.flush()
 
 
 def is_trusted_origin(origin: str | None) -> bool:
     """Return True only if origin is in the configured allowlist.
     Wildcard '*' is NOT accepted as a production FRONTEND_ORIGIN value (S5).
+    In production, missing FRONTEND_ORIGIN does NOT fall back to localhost.
     """
     if not origin:
         return True
     clean_origin = origin.rstrip('/')
     is_production = os.getenv('APP_ENV') == 'production'
     # Build the allowlist from the environment variable.
-    raw = os.getenv('FRONTEND_ORIGIN', 'http://localhost:3000').rstrip('/')
+    raw = os.getenv('FRONTEND_ORIGIN', '' if is_production else 'http://localhost:3000').rstrip('/')
     trusted = set()
     for item in raw.split(','):
         item = item.strip().rstrip('/')
@@ -99,6 +122,18 @@ def context(request: Request, db=Depends(get_db)):
     org = db.get(Organization, session.organization_id)
     if not user or not user.is_active or not member or member.status != 'active' or not org or org.status != 'active':
         raise HTTPException(403, 'Organization access is inactive')
+    # S5 – Session revocation and token versioning checks
+    sess_version = getattr(session, 'token_version', 1) or 1
+    user_version = getattr(user, 'token_version', 1) or 1
+    if sess_version != user_version:
+        raise HTTPException(401, 'Session has been revoked')
+    revoked_at = getattr(user, 'sessions_revoked_at', None)
+    sess_created = getattr(session, 'created_at', None)
+    if revoked_at and sess_created:
+        rev_dt = revoked_at if revoked_at.tzinfo else revoked_at.replace(tzinfo=timezone.utc)
+        crt_dt = sess_created if sess_created.tzinfo else sess_created.replace(tzinfo=timezone.utc)
+        if crt_dt <= rev_dt:
+            raise HTTPException(401, 'Session has been revoked')
     if request.method not in ('GET', 'HEAD', 'OPTIONS'):
         if request.headers.get('X-Timely-Request') != '1':
             raise HTTPException(403, 'Missing request protection header')

@@ -193,9 +193,8 @@ def test_s3_federated_user_authentication_lifecycle(setup):
         db.commit()
 
     # Mock MongoDB functions from app.mongo:
-    # Scenario A: is_attendance_user returns True, but authenticate_attendance_user returns None
-    # (e.g. employee deactivated upstream in MongoDB or password changed upstream)
-    with patch('app.mongo.is_attendance_user', return_value=True), \
+    # Scenario A: is_attendance_user returns True, but authenticate_attendance_user returns None (wrong password)
+    with patch('app.mongo.check_attendance_user_status', return_value=(True, True)), \
          patch('app.mongo.authenticate_attendance_user', return_value=None):
         limiter.buckets.clear()
         # Even though payload has 'OldLocalPassword123!' which matches local hash,
@@ -207,18 +206,20 @@ def test_s3_federated_user_authentication_lifecycle(setup):
         })
         assert res.status_code == 401, "Stale local password must NOT authenticate a federated user!"
 
-        # And local user is marked inactive
+        # S3 Fix: Wrong password must NOT disable the account globally!
         with factory() as db:
             refreshed = db.scalar(select(User).where(User.email == federated_email))
-            assert refreshed.is_active is False
+            assert refreshed.is_active is True, "Wrong password must NOT disable account globally!"
 
     # Scenario B: User provides correct upstream password in MongoDB
-    with patch('app.mongo.is_attendance_user', return_value=True), \
+    with patch('app.mongo.check_attendance_user_status', return_value=(True, True)), \
          patch('app.mongo.authenticate_attendance_user', return_value={
+             '_id': 'mock_att_id_123',
              'email': federated_email,
              'name': 'Federated Agent',
              'role': 'agent',
-             'status': 'active'
+             'status': 'active',
+             'entitled_org_slug': 'timely-health'
          }):
         limiter.buckets.clear()
         res_ok = client.post(ROOT + '/auth/login', json={
@@ -230,3 +231,212 @@ def test_s3_federated_user_authentication_lifecycle(setup):
         data = res_ok.json()
         assert data['user']['email'] == federated_email
         assert data['role'] == 'agent'
+
+
+def test_s2_cross_tenant_provisioning_prevented(setup):
+    """
+    S2 – Critical: Cross-tenant identity provisioning.
+    Verifies that a valid external/attendance identity CANNOT automatically
+    receive membership in an unentitled/arbitrary organization (e.g. Org B).
+    """
+    factory, ids = setup
+    client = TestClient(app, headers={'X-Timely-Request': '1'})
+    limiter.buckets.clear()
+
+    # Create Organization B
+    with factory() as db:
+        org_b = db.scalar(select(Organization).where(Organization.slug == 'org-b'))
+        if not org_b:
+            org_b = Organization(name='Organization B', slug='org-b', status='active')
+            db.add(org_b)
+            db.commit()
+
+    external_email = 'external_user@timelyhealth.in'
+    # Mock valid attendance authentication where user is entitled ONLY to timely-health
+    with patch('app.mongo.check_attendance_user_status', return_value=(True, True)), \
+         patch('app.mongo.authenticate_attendance_user', return_value={
+             '_id': 'att_ext_456',
+             'email': external_email,
+             'name': 'External Att User',
+             'role': 'admin',
+             'status': 'active',
+             'entitled_org_slug': 'timely-health'
+         }):
+        limiter.buckets.clear()
+        # Attempt to log into Organization B
+        res = client.post(ROOT + '/auth/login', json={
+            'email': external_email,
+            'password': 'ValidExternalPass123!',
+            'organization_slug': 'org-b'
+        })
+        assert res.status_code == 401, "External identity must NOT be auto-provisioned into unentitled Org B!"
+
+        # Verify NO membership was created for Org B
+        with factory() as db:
+            u = db.scalar(select(User).where(User.email == external_email))
+            if u:
+                org_b_ref = db.scalar(select(Organization).where(Organization.slug == 'org-b'))
+                mem = db.get(Membership, (org_b_ref.id, u.id))
+                assert mem is None, "Membership in unapproved tenant must NOT exist!"
+
+
+def test_s3_directory_outage_fails_closed(setup):
+    """
+    S3 – Critical: Directory outage / errors must FAIL CLOSED.
+    Must never fall back to local password verification for federated users.
+    """
+    factory, ids = setup
+    client = TestClient(app, headers={'X-Timely-Request': '1'})
+    limiter.buckets.clear()
+
+    federated_email = 'fed_failclosed@test.com'
+    with factory() as db:
+        org = db.scalar(select(Organization).where(Organization.slug == 'timely-health'))
+        u = User(
+            name='Fed FailClosed User',
+            email=federated_email,
+            password_hash=hash_password('OldLocalPasswordToNeverMatch!'),
+            is_active=True,
+            auth_provider='attendance'
+        )
+        db.add(u)
+        db.flush()
+        db.add(Membership(organization_id=org.id, user_id=u.id, role='agent', status='active'))
+        db.commit()
+
+    # Mock directory provider outage (provider_ok = False)
+    with patch('app.mongo.check_attendance_user_status', return_value=(False, False)):
+        limiter.buckets.clear()
+        res = client.post(ROOT + '/auth/login', json={
+            'email': federated_email,
+            'password': 'OldLocalPasswordToNeverMatch!',
+            'organization_slug': 'timely-health'
+        })
+        # Must fail closed with 503 Service Unavailable, NEVER authenticate via local hash
+        assert res.status_code == 503, "Directory outage must fail closed with 503!"
+
+
+def test_s5_session_revocation_prevents_token_revival(setup):
+    """
+    S5 – High: Session revocation & token versioning.
+    Verifies:
+    1. Active session token works normally.
+    2. Revoking user sessions invalidates existing token immediately.
+    3. Re-enabling account and logging in issues a new session.
+    4. Old token remains permanently revoked (CANNOT be revived!).
+    """
+    factory, ids = setup
+    client = TestClient(app, headers={'X-Timely-Request': '1', 'origin': 'http://localhost:3000'})
+    limiter.buckets.clear()
+
+    test_email = 'revocation_test@test.com'
+    test_pass = 'StrongPass12345!'
+    with factory() as db:
+        org = db.scalar(select(Organization).where(Organization.slug == 'timely-health'))
+        u = User(
+            name='Revocation Test User',
+            email=test_email,
+            password_hash=hash_password(test_pass),
+            is_active=True,
+            auth_provider='local',
+            token_version=1
+        )
+        db.add(u)
+        db.flush()
+        db.add(Membership(organization_id=org.id, user_id=u.id, role='agent', status='active'))
+        db.commit()
+        user_id = u.id
+
+    # 1. Login to obtain session token T1
+    login_1 = client.post(ROOT + '/auth/login', json={
+        'email': test_email,
+        'password': test_pass,
+        'organization_slug': 'timely-health'
+    })
+    assert login_1.status_code == 200
+    t1 = login_1.cookies.get('timely_session')
+    assert t1 is not None
+
+    # T1 works
+    me_1 = client.get(ROOT + '/organizations/me', cookies={'timely_session': t1})
+    assert me_1.status_code == 200
+
+    # 2. Revoke sessions for this user (e.g. account deactivated / sessions revoked)
+    with factory() as db:
+        from app.security import revoke_user_sessions
+        u = db.get(User, user_id)
+        u.is_active = False
+        revoke_user_sessions(db, user_id)
+        db.commit()
+
+    # T1 must now be rejected
+    me_revoked = client.get(ROOT + '/organizations/me', cookies={'timely_session': t1})
+    assert me_revoked.status_code in (401, 403)
+
+    # 3. Later, account is re-enabled and user logs in again -> gets session token T2
+    with factory() as db:
+        u = db.get(User, user_id)
+        u.is_active = True
+        db.commit()
+
+    limiter.buckets.clear()
+    login_2 = client.post(ROOT + '/auth/login', json={
+        'email': test_email,
+        'password': test_pass,
+        'organization_slug': 'timely-health'
+    })
+    assert login_2.status_code == 200
+    t2 = login_2.cookies.get('timely_session')
+    assert t2 != t1
+
+    # T2 works
+    me_2 = client.get(ROOT + '/organizations/me', cookies={'timely_session': t2})
+    assert me_2.status_code == 200
+
+    # 4. Old token T1 MUST STILL BE REJECTED (no token revival!)
+    me_t1_again = client.get(ROOT + '/organizations/me', cookies={'timely_session': t1})
+    assert me_t1_again.status_code == 401, "Old revoked token must NEVER become valid again!"
+
+
+def test_s4_shared_claim_queue_and_permissions(clients, setup):
+    """
+    S4 Agent Workflow:
+    Verifies paginated shared claim queue (/leads/queue), claiming a lead,
+    and subsequent restricted access for other agents.
+    """
+    admin_c = clients['admin']
+    agent_c = clients['agent']
+    factory, ids = setup
+
+    # Create 12 unaccepted leads
+    lead_ids = []
+    for i in range(12):
+        r = admin_c.post(ROOT + '/leads', json={
+            'full_name': f'Queue Lead {i+1}',
+            'phone': f'98765432{i:02d}',
+            'email': f'queue.lead.{i+1}@test.com'
+        })
+        assert r.status_code == 201
+        lead_ids.append(r.json()['id'])
+
+    # Agent checks page 1 of queue (page_size = 10)
+    q_page1 = agent_c.get(ROOT + '/leads/queue?page=1&page_size=10').json()
+    assert len(q_page1['items']) == 10
+    assert q_page1['total'] >= 12
+
+    # Agent checks page 2 of queue
+    q_page2 = agent_c.get(ROOT + '/leads/queue?page=2&page_size=10').json()
+    assert len(q_page2['items']) >= 2
+
+    # Agent accepts lead #1
+    target_id = lead_ids[0]
+    acc_res = agent_c.post(f"{ROOT}/leads/{target_id}/accept")
+    assert acc_res.status_code == 200
+    claimed = acc_res.json()
+    assert claimed['accepted_by'] is not None
+
+    # Lead #1 is now accepted; should no longer appear in unclaimed queue
+    q_after = agent_c.get(ROOT + '/leads/queue?page=1&page_size=20').json()
+    q_after_ids = [l['id'] for l in q_after['items']]
+    assert target_id not in q_after_ids
+

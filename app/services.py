@@ -47,16 +47,25 @@ def audit(db, ctx, action, target):
 def create_lead(db, org, data, source, actor=None, external_id=None, attribution=None):
     values = data.model_dump()
     if data.website_id:
-        scoped(db, Website, data.website_id, org)
-    check_assignee(db, org, data.assigned_to)
+        site = scoped(db, Website, data.website_id, org)
+        if not values.get('assigned_to') and site.config:
+            default_assignee = site.config.get('default_assignee')
+            if default_assignee:
+                check_assignee(db, org, default_assignee)
+                values['assigned_to'] = default_assignee
+    check_assignee(db, org, values.get('assigned_to'))
     if external_id and data.website_id:
         prior = db.scalar(select(Lead).where(Lead.website_id == data.website_id, Lead.external_submission_id == external_id, Lead.organization_id == org))
         if prior:
             return prior, True
     match = duplicate(db, org, data)
-    values['assigned_to'] = values.get('assigned_to') if actor else None
-    values['accepted_by'] = actor if actor else None
-    values['accepted_at'] = now() if actor else None
+    assigned = values.get('assigned_to')
+    if actor and assigned and assigned == actor:
+        values['accepted_by'] = actor
+        values['accepted_at'] = now()
+    else:
+        values['accepted_by'] = None
+        values['accepted_at'] = None
     lead = Lead(
         **values,
         organization_id=org,
