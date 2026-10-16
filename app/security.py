@@ -61,6 +61,25 @@ def new_session(db, user, organization_id):
     return token
 
 
+def is_trusted_origin(origin: str | None) -> bool:
+    if not origin:
+        return True
+    clean_origin = origin.rstrip('/')
+    allowed = os.getenv('FRONTEND_ORIGIN', 'http://localhost:3000').rstrip('/')
+    if allowed == '*':
+        return True
+    trusted = {
+        'http://localhost:3000',
+        'http://127.0.0.1:3000',
+        'http://localhost:8010',
+        'http://127.0.0.1:8010',
+    }
+    for item in allowed.split(','):
+        if item.strip():
+            trusted.add(item.strip().rstrip('/'))
+    return clean_origin in trusted
+
+
 def context(request: Request, db=Depends(get_db)):
     token = request.cookies.get('timely_session')
     if not token:
@@ -76,9 +95,8 @@ def context(request: Request, db=Depends(get_db)):
     if request.method not in ('GET', 'HEAD', 'OPTIONS'):
         if request.headers.get('X-Timely-Request') != '1':
             raise HTTPException(403, 'Missing request protection header')
-        allowed = os.getenv('FRONTEND_ORIGIN', 'http://localhost:3000').rstrip('/')
         origin = request.headers.get('origin')
-        if origin and origin.rstrip('/') != allowed:
+        if not is_trusted_origin(origin):
             raise HTTPException(403, 'Untrusted origin')
     return {'organization_id': org.id, 'user_id': user.id, 'role': member.role, 'user': user, 'organization': org}
 

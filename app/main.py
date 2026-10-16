@@ -18,7 +18,7 @@ from .db import get_db, now
 from .imports import MAX_BYTES, commit_job, parse_file, preview_job, safe_csv_cell
 from .models import Activity, AuditLog, AuthSession, FollowUp, ImportErrorRow, ImportJob, Lead, Membership, Organization, User, Website, WebsiteKey
 from .schemas import CommitInput, FollowUpInput, FollowUpUpdate, LeadInput, Login, MembershipInput, MergeInput, NoteInput, WebsiteInput
-from .security import DUMMY_PASSWORD, admin, context, digest, hash_password, limiter, new_session, verify_password, writer
+from .security import DUMMY_PASSWORD, admin, context, digest, hash_password, is_trusted_origin, limiter, new_session, verify_password, writer
 from .services import activity, audit, check_assignee, create_lead, scoped, serialize, sync_next_follow_up
 
 app = FastAPI(title='Timely CRM', version='1.0.0')
@@ -174,8 +174,8 @@ def health(db=Depends(get_db)):
 @app.post('/api/v1/auth/login')
 def login(payload: Login, request: Request, response: Response, db=Depends(get_db)):
     limiter.check(('login', request.client.host), 10, 300)
-    allowed = os.getenv('FRONTEND_ORIGIN', 'http://localhost:3000').rstrip('/')
-    if request.headers.get('X-Timely-Request') != '1' or (request.headers.get('origin') and request.headers['origin'].rstrip('/') != allowed):
+    origin = request.headers.get('origin')
+    if request.headers.get('X-Timely-Request') != '1' or not is_trusted_origin(origin):
         raise HTTPException(403, 'Untrusted sign-in request')
     user = db.scalar(select(User).where(User.email == payload.email.lower()))
     valid = verify_password(payload.password, user.password_hash if user else DUMMY_PASSWORD)
@@ -185,7 +185,8 @@ def login(payload: Login, request: Request, response: Response, db=Depends(get_d
         raise HTTPException(401, 'Invalid email, password or organization')
     token = new_session(db, user, org.id)
     db.commit()
-    response.set_cookie('timely_session', token, httponly=True, secure=os.getenv('APP_ENV') == 'production', samesite='lax', max_age=43200, path='/')
+    is_secure = os.getenv('APP_ENV') == 'production' and not (origin and (origin.startswith('http://localhost') or origin.startswith('http://127.0.0.1')))
+    response.set_cookie('timely_session', token, httponly=True, secure=is_secure, samesite='lax', max_age=43200, path='/')
     return {'user': serialize(user), 'organization': serialize(org), 'role': membership.role}
 
 
