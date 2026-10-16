@@ -135,6 +135,10 @@ def authenticate_attendance_user(identifier: str, password: str):
             ]
         })
         if emp and str(emp.get('password')) == str(password):
+            emp_status = str(emp.get('status', 'active')).strip().lower()
+            if emp_status != 'active':
+                print(f"[MongoDB Auth] Employee {emp.get('name')} is inactive in attendanceDB. Denying login.")
+                return None
             emp_role = str(emp.get('role', '')).lower()
             emp_dept = str(emp.get('department', '')).lower()
             if any(k in emp_role for k in ['admin', 'director', 'general manager']):
@@ -146,7 +150,8 @@ def authenticate_attendance_user(identifier: str, password: str):
             return {
                 'email': (emp.get('email') or f'{ident}@timelyhealth.in').lower(),
                 'name': emp.get('name') or 'Employee',
-                'role': crm_role
+                'role': crm_role,
+                'status': emp_status
             }
 
         # 3. Check 'empls' collection
@@ -157,12 +162,17 @@ def authenticate_attendance_user(identifier: str, password: str):
             ]
         })
         if empl and str(empl.get('password')) == str(password):
+            empl_status = str(empl.get('status', 'active')).strip().lower()
+            if empl_status != 'active':
+                print(f"[MongoDB Auth] Empl {empl.get('name')} is inactive in attendanceDB. Denying login.")
+                return None
             empl_dept = str(empl.get('department', '')).lower()
             crm_role = 'agent' if 'sales' in empl_dept else 'viewer'
             return {
                 'email': (empl.get('email') or f'{ident}@timelyhealth.in').lower(),
                 'name': empl.get('name') or 'Employee',
-                'role': crm_role
+                'role': crm_role,
+                'status': empl_status
             }
     except Exception as e:
         print(f"[MongoDB Auth] Error checking attendanceDB user: {e}")
@@ -171,30 +181,44 @@ def authenticate_attendance_user(identifier: str, password: str):
 
 def sync_sales_agents_from_mongo():
     """
-    Syncs sales department employees from attendanceDB into CRM members as agents.
-    Ensures ONLY sales department employees hold the 'agent' role.
+    Syncs active sales department employees from attendanceDB into CRM members as agents.
+    Ensures ONLY active sales department employees hold the 'agent' role.
+    Inactive employees or non-sales employees are downgraded or removed from CRM membership.
     """
     db_mongo = get_mongo_db()
     if db_mongo is None:
         return 0
 
     try:
-        from .models import User, Membership, Organization
+        from .models import User, Membership, Organization, Lead
         from .security import hash_password
 
-        sales_emps = list(db_mongo['employees'].find({'department': {'$regex': 'sales', '$options': 'i'}}))
-        sales_emails = set()
+        # Query ONLY active sales employees from attendanceDB
+        active_sales_emps = list(db_mongo['employees'].find({
+            'department': {'$regex': 'sales', '$options': 'i'},
+            'status': {'$regex': '^active$', '$options': 'i'}
+        }))
+        active_sales_emails = set()
+
+        # Query inactive sales employees
+        inactive_sales_emps = list(db_mongo['employees'].find({
+            'department': {'$regex': 'sales', '$options': 'i'},
+            'status': {'$regex': '^(?!active$).*$', '$options': 'i'}
+        }))
+        inactive_sales_emails = {
+            (e.get('email') or '').lower().strip() for e in inactive_sales_emps if (e.get('email') or '').strip()
+        }
 
         with SessionLocal() as db_crm:
             org = db_crm.scalar(select(Organization).where(Organization.slug == 'timely-health'))
             if not org:
                 return 0
 
-            for emp in sales_emps:
+            for emp in active_sales_emps:
                 email = (emp.get('email') or '').lower().strip()
                 if not email:
                     continue
-                sales_emails.add(email)
+                active_sales_emails.add(email)
                 name = (emp.get('name') or 'Sales Agent').strip()
                 pwd = str(emp.get('password') or 'Sales@123')
 
@@ -228,7 +252,23 @@ def sync_sales_agents_from_mongo():
                     membership.status = 'active'
                 db_crm.flush()
 
-            # Ensure any non-sales users currently marked as 'agent' are downgraded to 'viewer'
+            # For any inactive sales employees:
+            # Unassign any leads held by inactive users and remove their CRM membership
+            for inact_email in inactive_sales_emails:
+                u = db_crm.scalar(select(User).where(User.email == inact_email))
+                if u:
+                    u.is_active = False
+                    assigned_leads = db_crm.scalars(select(Lead).where(Lead.assigned_to == u.id)).all()
+                    for l in assigned_leads:
+                        l.assigned_to = None
+                    db_crm.flush()
+
+                    m = db_crm.get(Membership, (org.id, u.id))
+                    if m:
+                        db_crm.delete(m)
+                        print(f"[Sales Sync] Removed inactive sales employee {u.name} ({u.email}) from CRM members.")
+
+            # Ensure any other non-active-sales users currently marked as 'agent' are downgraded to 'viewer'
             memberships = db_crm.scalars(
                 select(Membership).where(
                     Membership.organization_id == org.id,
@@ -237,13 +277,13 @@ def sync_sales_agents_from_mongo():
             ).all()
             for m in memberships:
                 u = db_crm.get(User, m.user_id)
-                if u and u.email not in sales_emails:
+                if u and u.email not in active_sales_emails:
                     m.role = 'viewer'
-                    print(f"[Sales Sync] Updated non-sales user {u.name} ({u.email}) from agent to viewer.")
+                    print(f"[Sales Sync] Updated non-active/non-sales user {u.name} ({u.email}) from agent to viewer.")
 
             db_crm.commit()
-            print(f"[Sales Sync] Synced {len(sales_emails)} Sales Department agents from MongoDB attendanceDB.")
-            return len(sales_emails)
+            print(f"[Sales Sync] Synced {len(active_sales_emails)} ACTIVE Sales Department agents from MongoDB attendanceDB: {list(active_sales_emails)}")
+            return len(active_sales_emails)
     except Exception as e:
         print(f"[Sales Sync] Error: {e}")
         return 0
