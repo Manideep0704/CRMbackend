@@ -81,6 +81,13 @@ async def sync_website_leads_fallback_worker():
     await asyncio.sleep(5)
     while True:
         try:
+            # Direct Company MongoDB Sync
+            try:
+                from .mongo import sync_leads_from_mongo
+                sync_leads_from_mongo()
+            except Exception as e:
+                pass
+
             async with httpx.AsyncClient(timeout=10.0) as client:
                 res = await client.get('https://api.timelyhealth.in/api/consultation-leads?limit=50')
                 if res.status_code == 200:
@@ -342,6 +349,12 @@ def edit_lead(lead_id: str, payload: dict, ctx=Depends(writer), db=Depends(get_d
             setattr(lead, key, value)
     if changed:
         activity(db, ctx['organization_id'], lead.id, ctx['user_id'], 'updated', 'Updated: ' + ', '.join(changed))
+        if 'status' in changed and lead.external_submission_id:
+            try:
+                from .mongo import update_lead_in_mongo
+                update_lead_in_mongo(lead.external_submission_id, lead.status)
+            except Exception:
+                pass
         if 'next_follow_up_at' in payload:
             tasks = db.scalars(select(FollowUp).where(FollowUp.organization_id == ctx['organization_id'], FollowUp.lead_id == lead.id, FollowUp.status == 'open', FollowUp.title == 'Scheduled follow-up')).all()
             for task in tasks:
