@@ -68,11 +68,17 @@ def startup_db_init():
                 key_hash=key_hash
             ))
         db.commit()
-    asyncio.create_task(sync_website_leads_loop())
+    asyncio.create_task(sync_website_leads_fallback_worker())
 
 
-async def sync_website_leads_loop():
-    await asyncio.sleep(2)
+# ==============================================================================
+# FALLBACK RECONCILIATION WORKER
+# Webhook (/api/v1/public/leads) is the Primary Channel (0-second push).
+# This background worker is the Fallback Channel: every 30s it reconciles
+# with api.timelyhealth.in to automatically catch and recover any missed leads.
+# ==============================================================================
+async def sync_website_leads_fallback_worker():
+    await asyncio.sleep(5)
     while True:
         try:
             async with httpx.AsyncClient(timeout=10.0) as client:
@@ -84,6 +90,7 @@ async def sync_website_leads_loop():
                         org = db.scalar(select(Organization).where(Organization.slug == 'timely-health'))
                         website = db.scalar(select(Website).where(Website.domain == 'digital.timelyhealth.in'))
                         if org and website:
+                            recovered = 0
                             for item in data:
                                 ext_id = f"timely-consultation:{item['_id']}"
                                 existing = db.scalar(select(Lead).where(
@@ -101,13 +108,35 @@ async def sync_website_leads_loop():
                                     )
                                     attribution = {
                                         'business_type': item.get('businessType') or '',
-                                        'form_id': 'timely-digital-consultation'
+                                        'form_id': 'timely-digital-consultation',
+                                        'ingest_channel': 'fallback_sync'
                                     }
                                     create_lead(db, org.id, lead_input, 'website', external_id=ext_id, attribution=attribution)
-                            db.commit()
+                                    recovered += 1
+                            if recovered > 0:
+                                db.commit()
+                                print(f"[CRM Fallback Sync] Recovered {recovered} lead(s) missed by primary webhook.")
         except Exception:
             pass
-        await asyncio.sleep(8)
+        await asyncio.sleep(30)
+
+
+@app.get('/api/v1/public/ingest-status')
+def ingest_channel_status():
+    return {
+        'status': 'healthy',
+        'primary': {
+            'type': 'webhook',
+            'endpoint': '/api/v1/public/leads',
+            'role': 'main_instant_push'
+        },
+        'fallback': {
+            'type': 'background_reconciliation_sync',
+            'target': 'https://api.timelyhealth.in/api/consultation-leads',
+            'interval_seconds': 30,
+            'role': 'automated_safety_net'
+        }
+    }
 
 
 @app.get('/api/v1/public/init-db')
@@ -405,6 +434,7 @@ async def public_lead(request: Request, x_api_key: str = Header(default=''), db=
     if not isinstance(external_id, str) or not external_id.strip() or len(external_id) > 160:
         raise HTTPException(422, 'A stable Idempotency-Key or external_submission_id (1-160 characters) is required')
     attribution = {k: str(raw[k])[:240] for k in ['form_id', 'campaign', 'business_type', 'utm_source', 'utm_medium', 'utm_campaign', 'utm_term', 'utm_content'] if k in raw}
+    attribution.setdefault('ingest_channel', 'primary_webhook')
     from pydantic import ValidationError
     try:
         data = LeadInput(**fields, website_id=website.id, assigned_to=website.config.get('assigned_to'))
@@ -420,7 +450,7 @@ async def public_lead(request: Request, x_api_key: str = Header(default=''), db=
         if not prior:
             raise
     # A stable response does not reveal whether a contact already exists.
-    return {'accepted': True}
+    return {'accepted': True, 'channel': 'primary_webhook'}
 
 
 @app.get('/api/v1/follow-ups')
