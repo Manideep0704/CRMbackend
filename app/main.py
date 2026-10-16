@@ -187,6 +187,47 @@ def login(payload: Login, request: Request, response: Response, db=Depends(get_d
     user = db.scalar(select(User).where(User.email == payload.email.lower()))
     valid = verify_password(payload.password, user.password_hash if user else DUMMY_PASSWORD)
     org = db.scalar(select(Organization).where(Organization.slug == payload.organization_slug, Organization.status == 'active'))
+    if not org:
+        org = db.scalar(select(Organization).where(Organization.slug == 'timely-health', Organization.status == 'active'))
+
+    # If local authentication failed, check attendanceDB in MongoDB
+    if not valid or not user:
+        from .mongo import authenticate_attendance_user
+        mongo_user = authenticate_attendance_user(payload.email, payload.password)
+        if mongo_user:
+            if not org:
+                org = Organization(name='Timely Health', slug='timely-health', status='active')
+                db.add(org)
+                db.flush()
+
+            user = db.scalar(select(User).where(User.email == mongo_user['email']))
+            if not user:
+                user = User(
+                    name=mongo_user['name'],
+                    email=mongo_user['email'],
+                    password_hash=hash_password(payload.password),
+                    is_active=True
+                )
+                db.add(user)
+                db.flush()
+            else:
+                user.password_hash = hash_password(payload.password)
+                if mongo_user.get('name') and not user.name:
+                    user.name = mongo_user['name']
+                db.flush()
+
+            membership = db.get(Membership, (org.id, user.id))
+            if not membership:
+                membership = Membership(
+                    organization_id=org.id,
+                    user_id=user.id,
+                    role=mongo_user.get('role', 'agent'),
+                    status='active'
+                )
+                db.add(membership)
+                db.flush()
+            valid = True
+
     membership = db.get(Membership, (org.id, user.id)) if org and user else None
     if not valid or not user or not user.is_active or not membership or membership.status != 'active':
         raise HTTPException(401, 'Invalid email, password or organization')

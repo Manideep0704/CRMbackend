@@ -95,3 +95,68 @@ def update_lead_in_mongo(external_id: str, new_status: str):
     except Exception as e:
         print(f"[MongoDB] Failed to update lead in MongoDB: {e}")
     return False
+
+
+def authenticate_attendance_user(identifier: str, password: str):
+    """
+    Validates credentials against attendanceDB in MongoDB.
+    Allows admins and employees from attendanceDB to access this CRM tool.
+    Supports login via email, mobile/phone, or employeeId.
+    """
+    db_mongo = get_mongo_db()
+    if db_mongo is None or not identifier or not password:
+        return None
+    try:
+        import re
+        ident = identifier.strip()
+        ident_pattern = {'$regex': f'^{re.escape(ident)}$', '$options': 'i'}
+
+        # 1. Check 'admins' collection
+        admin = db_mongo['admins'].find_one({
+            '$or': [
+                {'email': ident_pattern},
+                {'mobile': ident},
+                {'name': ident_pattern}
+            ]
+        })
+        if admin and str(admin.get('password')) == str(password):
+            return {
+                'email': (admin.get('email') or f'{ident}@timelyhealth.in').lower(),
+                'name': admin.get('name') or 'Admin',
+                'role': 'admin'
+            }
+
+        # 2. Check 'employees' collection
+        emp = db_mongo['employees'].find_one({
+            '$or': [
+                {'email': ident_pattern},
+                {'employeeId': ident_pattern},
+                {'phone': ident}
+            ]
+        })
+        if emp and str(emp.get('password')) == str(password):
+            emp_role = str(emp.get('role', '')).lower()
+            crm_role = 'admin' if any(k in emp_role for k in ['admin', 'director', 'manager']) else 'agent'
+            return {
+                'email': (emp.get('email') or f'{ident}@timelyhealth.in').lower(),
+                'name': emp.get('name') or 'Employee',
+                'role': crm_role
+            }
+
+        # 3. Check 'empls' collection
+        empl = db_mongo['empls'].find_one({
+            '$or': [
+                {'email': ident_pattern},
+                {'phone': ident}
+            ]
+        })
+        if empl and str(empl.get('password')) == str(password):
+            return {
+                'email': (empl.get('email') or f'{ident}@timelyhealth.in').lower(),
+                'name': empl.get('name') or 'Employee',
+                'role': 'agent'
+            }
+    except Exception as e:
+        print(f"[MongoDB Auth] Error checking attendanceDB user: {e}")
+    return None
+
