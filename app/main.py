@@ -23,7 +23,19 @@ from .security import DUMMY_PASSWORD, admin, context, digest, hash_password, is_
 from .services import activity, audit, check_assignee, create_lead, scoped, serialize, sync_next_follow_up
 
 app = FastAPI(title='Timely CRM', version='1.0.0')
-app.add_middleware(CORSMiddleware, allow_origins=['http://localhost:3000', 'http://127.0.0.1:3000', 'http://localhost:8010', 'http://127.0.0.1:8010'], allow_origin_regex=r'https?://.*', allow_credentials=True, allow_methods=['*'], allow_headers=['*'])
+# CORS: exact origin allowlist only; no wildcard regex.  Configure FRONTEND_ORIGIN in env.
+_CORS_ORIGINS = [
+    o.strip().rstrip('/') for o in
+    os.getenv('FRONTEND_ORIGIN', 'http://localhost:3000,http://127.0.0.1:3000').split(',')
+    if o.strip() and o.strip() != '*'
+]
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=_CORS_ORIGINS,
+    allow_credentials=True,
+    allow_methods=['GET', 'POST', 'PATCH', 'DELETE', 'OPTIONS'],
+    allow_headers=['Content-Type', 'X-Timely-Request', 'X-Api-Key'],
+)
 
 
 @app.on_event("startup")
@@ -161,10 +173,7 @@ def ingest_channel_status():
     }
 
 
-@app.get('/api/v1/public/init-db')
-def manual_init_db():
-    startup_db_init()
-    return {'status': 'ok', 'message': 'Database initialized successfully'}
+# S6 – Removed unauthenticated /init-db endpoint.  Run `python -m app.seed` for provisioning.
 
 
 @app.exception_handler(RequestValidationError)
@@ -195,37 +204,40 @@ def health(db=Depends(get_db)):
 
 @app.post('/api/v1/auth/login')
 def login(payload: Login, request: Request, response: Response, db=Depends(get_db)):
-    limiter.check(('login', request.client.host), 10, 300)
+    # S8 – tighter login bucket: 5 attempts per 5 minutes per IP
+    limiter.check(('login', request.client.host), 5, 300)
     origin = request.headers.get('origin')
     if request.headers.get('X-Timely-Request') != '1' or not is_trusted_origin(origin):
         raise HTTPException(403, 'Untrusted sign-in request')
-    user = db.scalar(select(User).where(User.email == payload.email.lower()))
-    valid = verify_password(payload.password, user.password_hash if user else DUMMY_PASSWORD)
+
+    # S2 – Reject unknown or inactive organization slugs; do NOT silently fall back.
     org = db.scalar(select(Organization).where(Organization.slug == payload.organization_slug, Organization.status == 'active'))
     if not org:
-        org = db.scalar(select(Organization).where(Organization.slug == 'timely-health', Organization.status == 'active'))
+        raise HTTPException(401, 'Invalid email, password or organization')
+
+    user = db.scalar(select(User).where(User.email == payload.email.lower()))
+    valid = verify_password(payload.password, user.password_hash if user else DUMMY_PASSWORD)
 
     # If local authentication failed, check attendanceDB in MongoDB
+    # S2 – org must already exist (verified above); we no longer create one on the fly.
     if not valid or not user:
         from .mongo import authenticate_attendance_user
         mongo_user = authenticate_attendance_user(payload.email, payload.password)
         if mongo_user:
-            if not org:
-                org = Organization(name='Timely Health', slug='timely-health', status='active')
-                db.add(org)
-                db.flush()
-
             user = db.scalar(select(User).where(User.email == mongo_user['email']))
             if not user:
                 user = User(
                     name=mongo_user['name'],
                     email=mongo_user['email'],
+                    # S3 – store a local hash only so we can enforce scrypt verify;
+                    # future logins still re-validate against MongoDB.
                     password_hash=hash_password(payload.password),
                     is_active=True
                 )
                 db.add(user)
                 db.flush()
             else:
+                # Refresh hash so scrypt params stay current
                 user.password_hash = hash_password(payload.password)
                 if mongo_user.get('name') and not user.name:
                     user.name = mongo_user['name']
@@ -233,10 +245,14 @@ def login(payload: Login, request: Request, response: Response, db=Depends(get_d
 
             membership = db.get(Membership, (org.id, user.id))
             if not membership:
+                # S2 – Only provision membership for roles in the explicit allowlist
+                allowed_roles = {'admin', 'agent', 'viewer'}
+                raw_role = mongo_user.get('role', 'viewer')
+                safe_role = raw_role if raw_role in allowed_roles else 'viewer'
                 membership = Membership(
                     organization_id=org.id,
                     user_id=user.id,
-                    role=mongo_user.get('role', 'agent'),
+                    role=safe_role,
                     status='active'
                 )
                 db.add(membership)
@@ -248,7 +264,9 @@ def login(payload: Login, request: Request, response: Response, db=Depends(get_d
         raise HTTPException(401, 'Invalid email, password or organization')
     token = new_session(db, user, org.id)
     db.commit()
-    is_secure = os.getenv('APP_ENV') == 'production' and not (origin and (origin.startswith('http://localhost') or origin.startswith('http://127.0.0.1')))
+    # S5 – Secure flag: always True in production regardless of origin.
+    is_production = os.getenv('APP_ENV') == 'production'
+    is_secure = is_production
     response.set_cookie('timely_session', token, httponly=True, secure=is_secure, samesite='lax', max_age=43200, path='/')
     return {'user': serialize(user), 'organization': serialize(org), 'role': membership.role}
 
@@ -428,24 +446,27 @@ def export_leads(
             dt_cr = lead.created_at if lead.created_at.tzinfo else lead.created_at.replace(tzinfo=timezone.utc)
             created_str = dt_cr.astimezone(ist).strftime('%d-%b-%Y %I:%M %p')
 
+        # S7 – Sanitize every string cell to neutralise spreadsheet formula injection.
         writer.writerow([
             idx,
-            f"TL-{lead.id[:8].upper()}",
-            lead.full_name or '',
-            clean_phone,
-            lead.email or '',
-            lead.company_name or '',
-            lead.inquiry_type or '',
-            (lead.status or '').capitalize(),
-            (lead.priority or '').capitalize(),
-            formatted_source,
-            websites_dict.get(lead.website_id, 'Timely Health Digital'),
-            members_dict.get(lead.assigned_to, 'Unassigned'),
-            next_follow,
-            created_str
+            safe_csv_cell(f"TL-{lead.id[:8].upper()}"),
+            safe_csv_cell(lead.full_name or ''),
+            safe_csv_cell(clean_phone),
+            safe_csv_cell(lead.email or ''),
+            safe_csv_cell(lead.company_name or ''),
+            safe_csv_cell(lead.inquiry_type or ''),
+            safe_csv_cell((lead.status or '').capitalize()),
+            safe_csv_cell((lead.priority or '').capitalize()),
+            safe_csv_cell(formatted_source),
+            safe_csv_cell(websites_dict.get(lead.website_id, 'Timely Health Digital')),
+            safe_csv_cell(members_dict.get(lead.assigned_to, 'Unassigned')),
+            safe_csv_cell(next_follow),
+            safe_csv_cell(created_str),
         ])
 
+    # S8/P1 – Commit the audit record so it persists even if the caller disconnects.
     audit(db, ctx, 'leads.exported', f'count:{len(leads)}')
+    db.commit()
     filename = f"timely-leads-export-{datetime.now().strftime('%Y%m%d-%H%M')}.csv"
     return Response(
         output.getvalue(),

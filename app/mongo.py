@@ -7,10 +7,16 @@ from .models import Organization, Website, Lead
 from .schemas import LeadInput
 from .services import create_lead
 
-MONGO_URI = os.getenv(
-    'MONGO_URI',
-    'mongodb+srv://saquiba:saquiba123@cluster0.hrgeeif.mongodb.net/attendanceDB?retryWrites=true&w=majority&appName=attendance'
-)
+# S1 – Credentials must be supplied via the MONGO_URI environment variable.
+# No default value is provided; if unset, MongoDB-dependent features are disabled at startup.
+MONGO_URI = os.getenv('MONGO_URI', '')
+if not MONGO_URI:
+    import warnings
+    warnings.warn(
+        '[CRM] MONGO_URI is not set. MongoDB-backed features (lead sync, attendance auth) will be disabled. '
+        'Set MONGO_URI in your .env file or environment.',
+        stacklevel=1,
+    )
 
 def get_mongo_db():
     if not MONGO_URI:

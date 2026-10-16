@@ -62,21 +62,28 @@ def new_session(db, user, organization_id):
 
 
 def is_trusted_origin(origin: str | None) -> bool:
+    """Return True only if origin is in the configured allowlist.
+    Wildcard '*' is NOT accepted as a production FRONTEND_ORIGIN value (S5).
+    """
     if not origin:
         return True
     clean_origin = origin.rstrip('/')
-    allowed = os.getenv('FRONTEND_ORIGIN', 'http://localhost:3000').rstrip('/')
-    if allowed == '*':
-        return True
-    trusted = {
-        'http://localhost:3000',
-        'http://127.0.0.1:3000',
-        'http://localhost:8010',
-        'http://127.0.0.1:8010',
-    }
-    for item in allowed.split(','):
-        if item.strip():
-            trusted.add(item.strip().rstrip('/'))
+    is_production = os.getenv('APP_ENV') == 'production'
+    # Build the allowlist from the environment variable.
+    raw = os.getenv('FRONTEND_ORIGIN', 'http://localhost:3000').rstrip('/')
+    trusted = set()
+    for item in raw.split(','):
+        item = item.strip().rstrip('/')
+        if item and item != '*':
+            trusted.add(item)
+    # Always trust localhost origins in non-production only.
+    if not is_production:
+        trusted.update({
+            'http://localhost:3000',
+            'http://127.0.0.1:3000',
+            'http://localhost:8010',
+            'http://127.0.0.1:8010',
+        })
     return clean_origin in trusted
 
 
