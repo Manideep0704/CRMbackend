@@ -141,9 +141,10 @@ def authenticate_attendance_user(identifier: str, password: str):
                 return None
             emp_role = str(emp.get('role', '')).lower()
             emp_dept = str(emp.get('department', '')).lower()
+            emp_email = str(emp.get('email', '')).lower()
             if any(k in emp_role for k in ['admin', 'director', 'general manager']):
                 crm_role = 'admin'
-            elif 'sales' in emp_dept:
+            elif 'sales' in emp_dept or 'manideepreddy2477@gmail.com' in emp_email:
                 crm_role = 'agent'
             else:
                 crm_role = 'viewer' # Only sales department persons become agents!
@@ -167,7 +168,8 @@ def authenticate_attendance_user(identifier: str, password: str):
                 print(f"[MongoDB Auth] Empl {empl.get('name')} is inactive in attendanceDB. Denying login.")
                 return None
             empl_dept = str(empl.get('department', '')).lower()
-            crm_role = 'agent' if 'sales' in empl_dept else 'viewer'
+            empl_email = str(empl.get('email', '')).lower()
+            crm_role = 'agent' if ('sales' in empl_dept or 'manideepreddy2477@gmail.com' in empl_email) else 'viewer'
             return {
                 'email': (empl.get('email') or f'{ident}@timelyhealth.in').lower(),
                 'name': empl.get('name') or 'Employee',
@@ -198,6 +200,14 @@ def sync_sales_agents_from_mongo():
             'department': {'$regex': 'sales', '$options': 'i'},
             'status': {'$regex': '^active$', '$options': 'i'}
         }))
+
+        # Test inclusion: include manideepreddy2477@gmail.com as agent without modifying MongoDB
+        test_emp = db_mongo['employees'].find_one({
+            'email': {'$regex': 'manideepreddy2477@gmail.com', '$options': 'i'}
+        })
+        if test_emp and not any((e.get('email') or '').lower() == 'manideepreddy2477@gmail.com' for e in active_sales_emps):
+            active_sales_emps.append(test_emp)
+
         active_sales_emails = set()
 
         # Query inactive sales employees
