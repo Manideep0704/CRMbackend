@@ -336,12 +336,12 @@ def revoke_key(website_id: str, ctx=Depends(admin), db=Depends(get_db)):
     return {'ok': True}
 
 
-def lead_query(ctx, q='', status='', website_id='', source='', date_from=None, date_to=None):
+def lead_query(ctx, q='', status='', website_id='', source='', assigned_to='', date_from=None, date_to=None):
     query = select(Lead).where(Lead.organization_id == ctx['organization_id'], Lead.deleted_at.is_(None))
     if q:
         pattern = '%' + q.replace('\\', '\\\\').replace('%', '\\%').replace('_', '\\_') + '%'
         query = query.where(or_(*[column.ilike(pattern, escape='\\') for column in [Lead.full_name, Lead.email, Lead.phone, Lead.company_name]]))
-    for column, value in [(Lead.status, status), (Lead.website_id, website_id), (Lead.source, source)]:
+    for column, value in [(Lead.status, status), (Lead.website_id, website_id), (Lead.source, source), (Lead.assigned_to, assigned_to)]:
         if value:
             query = query.where(column == value)
     if date_from:
@@ -356,10 +356,16 @@ def lead_query(ctx, q='', status='', website_id='', source='', date_from=None, d
 
 
 @app.get('/api/v1/leads')
-def leads(q: str = '', status: str = '', website_id: str = '', source: str = '', date_from: datetime | None = None, date_to: datetime | None = None, page: int = 1, page_size: int = 20, sort: str = 'newest', ctx=Depends(context), db=Depends(get_db)):
+def leads(q: str = '', status: str = '', website_id: str = '', source: str = '', assigned_to: str = '', pipeline: bool = False, date_from: datetime | None = None, date_to: datetime | None = None, page: int = 1, page_size: int = 20, sort: str = 'newest', ctx=Depends(context), db=Depends(get_db)):
     if page < 1 or not 1 <= page_size <= 100:
         raise HTTPException(422, 'Invalid pagination')
-    query = lead_query(ctx, q, status, website_id, source, date_from, date_to)
+    
+    # In deal pipeline: admin sees all leads (or filters by agent); agent strictly sees only their assigned leads
+    eff_assigned_to = assigned_to
+    if pipeline and ctx['role'] == 'agent':
+        eff_assigned_to = ctx['user_id']
+
+    query = lead_query(ctx, q, status, website_id, source, eff_assigned_to, date_from, date_to)
     count = db.scalar(select(func.count()).select_from(query.subquery()))
     order = {'newest': Lead.created_at.desc(), 'oldest': Lead.created_at.asc(), 'name': Lead.full_name.asc()}.get(sort)
     if order is None:
@@ -717,8 +723,8 @@ def import_errors(job_id: str, ctx=Depends(context), db=Depends(get_db)):
 
 
 @app.get('/api/v1/dashboard/summary')
-def dashboard(website_id: str = '', source: str = '', date_from: datetime | None = None, date_to: datetime | None = None, ctx=Depends(context), db=Depends(get_db)):
-    query = lead_query(ctx, website_id=website_id, source=source, date_from=date_from, date_to=date_to)
+def dashboard(website_id: str = '', source: str = '', assigned_to: str = '', date_from: datetime | None = None, date_to: datetime | None = None, ctx=Depends(context), db=Depends(get_db)):
+    query = lead_query(ctx, website_id=website_id, source=source, assigned_to=assigned_to, date_from=date_from, date_to=date_to)
     rows = db.scalars(query).all()
     status_counts = {s: sum(l.status == s for l in rows) for s in ['new', 'contacted', 'qualified', 'converted', 'lost']}
     # Due today is defined in the business timezone, Asia/Kolkata.
@@ -731,7 +737,8 @@ def dashboard(website_id: str = '', source: str = '', date_from: datetime | None
     dates = [t.due_at.replace(tzinfo=timezone.utc) for t in tasks]
     sources = {s: sum(l.source == s for l in rows) for s in ['manual', 'website', 'csv', 'xlsx']}
     sites = db.scalars(select(Website).where(Website.organization_id == ctx['organization_id'])).all()
-    unaccepted = [l for l in rows if not l.accepted_by]
+    unaccepted_query = select(Lead).where(Lead.organization_id == ctx['organization_id'], Lead.deleted_at.is_(None), Lead.accepted_by.is_(None))
+    unaccepted = db.scalars(unaccepted_query).all()
     unaccepted_leads = [{'id': l.id, 'full_name': l.full_name, 'company_name': l.company_name, 'source': l.source, 'created_at': l.created_at.isoformat() if l.created_at else None} for l in unaccepted[:10]]
     return {'total': len(rows), 'new_in_period': len(rows), 'uncontacted': status_counts['new'], 'unaccepted_count': len(unaccepted), 'unaccepted_leads': unaccepted_leads, 'statuses': status_counts, 'conversion_rate': round(status_counts['converted'] / len(rows) * 100, 1) if rows else 0, 'due_today': sum(start <= d < end for d in dates), 'overdue': sum(d < now() for d in dates), 'sources': sources, 'websites': [{'id': w.id, 'name': w.name, 'count': sum(l.website_id == w.id for l in rows)} for w in sites], 'cohort': 'Leads created within the selected date range', 'timezone': 'Asia/Kolkata'}
 
