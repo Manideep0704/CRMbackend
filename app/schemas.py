@@ -34,6 +34,12 @@ class LeadInput(StrictModel):
         digits = re.sub(r'\D', '', value)
         if not 7 <= len(digits) <= 15:
             raise ValueError('Phone must contain 7 to 15 digits')
+        if len(digits) == 12 and digits.startswith('91'):
+            return digits[2:]
+        if len(digits) == 11 and digits.startswith('0'):
+            return digits[1:]
+        if len(digits) == 10:
+            return digits
         return ('+' if value.startswith('+') else '') + digits
 
     @field_validator('email')

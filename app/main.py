@@ -3,6 +3,7 @@ import csv
 import io
 import json
 import os
+import re
 import secrets
 from datetime import datetime, timedelta, timezone
 
@@ -386,7 +387,16 @@ def export_leads(
     members_dict = {u.id: u.name for u in db.scalars(select(User).join(Membership, (Membership.user_id == User.id) & (Membership.organization_id == ctx['organization_id'])))}
 
     for idx, lead in enumerate(leads, 1):
-        clean_phone = (lead.phone or '').replace("'", "").strip()
+        raw_p = (lead.phone or '').replace("'", "").strip()
+        p_digits = re.sub(r'\D', '', raw_p)
+        if len(p_digits) == 12 and p_digits.startswith('91'):
+            clean_phone = p_digits[2:]
+        elif len(p_digits) == 11 and p_digits.startswith('0'):
+            clean_phone = p_digits[1:]
+        elif len(p_digits) == 10:
+            clean_phone = p_digits
+        else:
+            clean_phone = p_digits or raw_p
         formatted_source = 'Website Form' if lead.source == 'website' else 'Manual Entry' if lead.source == 'manual' else (lead.source or '').upper()
         next_follow = '-'
         if lead.next_follow_up_at:
