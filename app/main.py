@@ -29,7 +29,15 @@ app.add_middleware(CORSMiddleware, allow_origins=['http://localhost:3000', 'http
 @app.on_event("startup")
 def startup_db_init():
     from .db import Base, engine, SessionLocal
+    from sqlalchemy import text
     Base.metadata.create_all(bind=engine)
+    with engine.connect() as conn:
+        for col, col_type in [('accepted_by', 'VARCHAR(36)'), ('accepted_at', 'DATETIME')]:
+            try:
+                conn.execute(text(f"ALTER TABLE leads ADD COLUMN {col} {col_type}"))
+                conn.commit()
+            except Exception:
+                pass
     with SessionLocal() as db:
         org = db.scalar(select(Organization).where(Organization.slug == "timely-health"))
         if not org:
@@ -444,12 +452,44 @@ def get_lead(lead_id: str, ctx=Depends(context), db=Depends(get_db)):
     return {**serialize(lead), 'activities': [serialize(e) for e in events]}
 
 
+@app.post('/api/v1/leads/{lead_id}/accept')
+def accept_lead(lead_id: str, ctx=Depends(writer), db=Depends(get_db)):
+    lead = scoped(db, Lead, lead_id, ctx['organization_id'], lock=True)
+    if lead.accepted_by:
+        accepted_user = db.get(User, lead.accepted_by)
+        name = accepted_user.name if accepted_user else 'another agent'
+        raise HTTPException(400, f'This lead has already been accepted by {name}.')
+    
+    lead.accepted_by = ctx['user_id']
+    lead.accepted_at = now()
+    lead.assigned_to = ctx['user_id']
+    if lead.status == 'new':
+        lead.status = 'contacted'
+        if lead.external_submission_id:
+            try:
+                from .mongo import update_lead_in_mongo
+                update_lead_in_mongo(lead.external_submission_id, lead.status)
+            except Exception:
+                pass
+
+    user = db.get(User, ctx['user_id'])
+    agent_name = user.name if user else 'Agent'
+    activity(db, ctx['organization_id'], lead.id, ctx['user_id'], 'accepted', f'Lead accepted by {agent_name}')
+    audit(db, ctx, 'lead.accepted', lead.id)
+    db.commit()
+    return serialize(lead)
+
+
 @app.patch('/api/v1/leads/{lead_id}')
 def edit_lead(lead_id: str, payload: dict, ctx=Depends(writer), db=Depends(get_db)):
     lead = scoped(db, Lead, lead_id, ctx['organization_id'], lock=True)
     unknown = set(payload) - set(LeadInput.model_fields)
     if unknown:
         raise HTTPException(422, 'Unsupported lead fields')
+    # If diverting or reassigning an already accepted lead, only Admins are authorized
+    if 'assigned_to' in payload and payload['assigned_to'] != lead.assigned_to:
+        if lead.accepted_by and ctx['role'] != 'admin':
+            raise HTTPException(403, 'Once a lead has been accepted, it can only be diverted or reassigned on the Admin side.')
     from pydantic import ValidationError
     try:
         values = {key: getattr(lead, key) for key in LeadInput.model_fields}
@@ -685,7 +725,9 @@ def dashboard(website_id: str = '', source: str = '', date_from: datetime | None
     dates = [t.due_at.replace(tzinfo=timezone.utc) for t in tasks]
     sources = {s: sum(l.source == s for l in rows) for s in ['manual', 'website', 'csv', 'xlsx']}
     sites = db.scalars(select(Website).where(Website.organization_id == ctx['organization_id'])).all()
-    return {'total': len(rows), 'new_in_period': len(rows), 'uncontacted': status_counts['new'], 'statuses': status_counts, 'conversion_rate': round(status_counts['converted'] / len(rows) * 100, 1) if rows else 0, 'due_today': sum(start <= d < end for d in dates), 'overdue': sum(d < now() for d in dates), 'sources': sources, 'websites': [{'id': w.id, 'name': w.name, 'count': sum(l.website_id == w.id for l in rows)} for w in sites], 'cohort': 'Leads created within the selected date range', 'timezone': 'Asia/Kolkata'}
+    unaccepted = [l for l in rows if not l.accepted_by]
+    unaccepted_leads = [{'id': l.id, 'full_name': l.full_name, 'company_name': l.company_name, 'source': l.source, 'created_at': l.created_at.isoformat() if l.created_at else None} for l in unaccepted[:10]]
+    return {'total': len(rows), 'new_in_period': len(rows), 'uncontacted': status_counts['new'], 'unaccepted_count': len(unaccepted), 'unaccepted_leads': unaccepted_leads, 'statuses': status_counts, 'conversion_rate': round(status_counts['converted'] / len(rows) * 100, 1) if rows else 0, 'due_today': sum(start <= d < end for d in dates), 'overdue': sum(d < now() for d in dates), 'sources': sources, 'websites': [{'id': w.id, 'name': w.name, 'count': sum(l.website_id == w.id for l in rows)} for w in sites], 'cohort': 'Leads created within the selected date range', 'timezone': 'Asia/Kolkata'}
 
 
 @app.get('/api/v1/audit-logs')

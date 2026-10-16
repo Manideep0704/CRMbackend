@@ -54,7 +54,17 @@ def create_lead(db, org, data, source, actor=None, external_id=None, attribution
         if prior:
             return prior, True
     match = duplicate(db, org, data)
-    lead = Lead(**values, organization_id=org, source=source, duplicate_of=match.id if match else None, external_submission_id=external_id, attribution=attribution or {})
+    values['assigned_to'] = values.get('assigned_to') if actor else None
+    values['accepted_by'] = actor if actor else None
+    values['accepted_at'] = now() if actor else None
+    lead = Lead(
+        **values,
+        organization_id=org,
+        source=source,
+        duplicate_of=match.id if match else None,
+        external_submission_id=external_id,
+        attribution=attribution or {}
+    )
     db.add(lead)
     db.flush()
     activity(db, org, lead.id, actor, 'created', f'Lead created via {source}' + ('; possible duplicate flagged' if match else ''))

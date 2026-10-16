@@ -68,6 +68,8 @@ class Lead(Base):
     organization_id: Mapped[str] = mapped_column(ForeignKey('organizations.id'), index=True)
     website_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
     assigned_to: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    accepted_by: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    accepted_at: Mapped[object | None] = mapped_column(DateTime(timezone=True), nullable=True)
     full_name: Mapped[str] = mapped_column(String(160))
     phone: Mapped[str] = mapped_column(String(32), default='', index=True)
     email: Mapped[str] = mapped_column(String(254), default='', index=True)
