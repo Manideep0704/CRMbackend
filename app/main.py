@@ -77,6 +77,11 @@ def startup_db_init():
                 key_hash=key_hash
             ))
         db.commit()
+    try:
+        from .mongo import sync_sales_agents_from_mongo
+        sync_sales_agents_from_mongo()
+    except Exception as e:
+        print(f"[Sales Sync Startup Error]: {e}")
     asyncio.create_task(sync_website_leads_fallback_worker())
 
 
@@ -92,8 +97,9 @@ async def sync_website_leads_fallback_worker():
         try:
             # Direct Company MongoDB Sync
             try:
-                from .mongo import sync_leads_from_mongo
+                from .mongo import sync_leads_from_mongo, sync_sales_agents_from_mongo
                 sync_leads_from_mongo()
+                sync_sales_agents_from_mongo()
             except Exception as e:
                 pass
 
