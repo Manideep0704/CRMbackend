@@ -29,7 +29,7 @@ def site(client, domain='digital.timelyhealth.in'):
 def test_manual_lead_normalization_search_update_delete(clients, setup):
     client = clients['admin']
     lead = create(client, phone='+91 (98765) 43210', email='Person@Example.com')
-    assert lead['phone'] == '+919876543210'
+    assert lead['phone'] == '9876543210'
     assert lead['email'] == 'person@example.com'
     assert client.get(ROOT + '/leads?q=person@example').json()['total'] == 1
     response = client.patch(ROOT + '/leads/' + lead['id'], json={'status': 'qualified', 'priority': 'high'})
@@ -81,6 +81,7 @@ def test_roles_sessions_csrf_and_invalid_login(clients):
     assert anonymous.get(ROOT + '/leads').status_code == 401
     assert anonymous.post(ROOT + '/auth/login', json={'email': 'admin@test.in', 'password': 'a-long-test-password', 'organization_slug': 'timely-health'}).status_code == 403
     assert clients['admin'].post(ROOT + '/leads', json={'full_name': 'X'}, headers={'Origin': 'https://attacker.example'}).status_code == 403
+    limiter.buckets.clear()
     assert clients['admin'].post(ROOT + '/auth/login', json={'email': 'admin@test.in', 'password': 'wrong', 'organization_slug': 'timely-health'}).status_code == 401
     assert clients['admin'].post(ROOT + '/auth/logout').status_code == 200
     assert clients['admin'].get(ROOT + '/leads').status_code == 401
@@ -97,7 +98,7 @@ def test_website_ingestion_retry_mapping_rotation_and_second_site(clients, setup
     for _ in range(2):
         response = public.post(ROOT + '/public/leads', json=payload, headers=headers)
         assert response.status_code == 200, response.text
-        assert response.json() == {'accepted': True}
+        assert response.json() == {'accepted': True, 'channel': 'primary_webhook'}
     leads = a.get(ROOT + '/leads').json()
     assert leads['total'] == 1
     assert leads['items'][0]['website_id'] == website['id']

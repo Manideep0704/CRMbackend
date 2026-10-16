@@ -187,6 +187,31 @@ def authenticate_attendance_user(identifier: str, password: str):
     return None
 
 
+def is_attendance_user(identifier: str) -> bool:
+    """
+    S3 – Checks if an identifier (email, phone, employeeId) exists in attendanceDB (MongoDB).
+    Used to distinguish federated accounts from local accounts so local password fallback
+    is disabled for federated users.
+    """
+    db_mongo = get_mongo_db()
+    if db_mongo is None or not identifier:
+        return False
+    try:
+        import re
+        ident = identifier.strip()
+        ident_pattern = {'$regex': f'^{re.escape(ident)}$', '$options': 'i'}
+        if db_mongo['admins'].find_one({'$or': [{'email': ident_pattern}, {'mobile': ident}, {'name': ident_pattern}]}, {'_id': 1}):
+            return True
+        if db_mongo['employees'].find_one({'$or': [{'email': ident_pattern}, {'employeeId': ident_pattern}, {'phone': ident}]}, {'_id': 1}):
+            return True
+        if db_mongo['empls'].find_one({'$or': [{'email': ident_pattern}, {'phone': ident}]}, {'_id': 1}):
+            return True
+        return False
+    except Exception as e:
+        print(f"[MongoDB] Error checking attendance user: {e}")
+        return False
+
+
 def sync_sales_agents_from_mongo():
     """
     Syncs active sales department employees from attendanceDB into CRM members as agents.
@@ -236,7 +261,11 @@ def sync_sales_agents_from_mongo():
                     continue
                 active_sales_emails.add(email)
                 name = (emp.get('name') or 'Sales Agent').strip()
-                pwd = str(emp.get('password') or 'Sales@123')
+                # S3 – Never use a shared/guessable fallback. Generate a unique
+                # random secret so the local hash is never a viable login credential.
+                # Federated users must always authenticate via MongoDB.
+                import secrets as _sec
+                pwd = emp.get('password') or _sec.token_urlsafe(32)
 
                 user = db_crm.scalar(select(User).where(User.email == email))
                 if not user:

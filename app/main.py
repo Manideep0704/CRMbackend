@@ -216,48 +216,63 @@ def login(payload: Login, request: Request, response: Response, db=Depends(get_d
         raise HTTPException(401, 'Invalid email, password or organization')
 
     user = db.scalar(select(User).where(User.email == payload.email.lower()))
-    valid = verify_password(payload.password, user.password_hash if user else DUMMY_PASSWORD)
 
-    # If local authentication failed, check attendanceDB in MongoDB
-    # S2 – org must already exist (verified above); we no longer create one on the fly.
-    if not valid or not user:
-        from .mongo import authenticate_attendance_user
+    # S3 – Distinguish local vs federated accounts.
+    # If the user exists in attendanceDB (MongoDB), they are a federated user.
+    # Local password fallback is completely disabled for federated users:
+    # upstream password changes and deactivations take effect immediately.
+    from .mongo import authenticate_attendance_user, is_attendance_user
+    is_federated = is_attendance_user(payload.email)
+    mongo_user = None
+
+    if is_federated:
         mongo_user = authenticate_attendance_user(payload.email, payload.password)
-        if mongo_user:
-            user = db.scalar(select(User).where(User.email == mongo_user['email']))
-            if not user:
-                user = User(
-                    name=mongo_user['name'],
-                    email=mongo_user['email'],
-                    # S3 – store a local hash only so we can enforce scrypt verify;
-                    # future logins still re-validate against MongoDB.
-                    password_hash=hash_password(payload.password),
-                    is_active=True
-                )
-                db.add(user)
-                db.flush()
-            else:
-                # Refresh hash so scrypt params stay current
-                user.password_hash = hash_password(payload.password)
-                if mongo_user.get('name') and not user.name:
-                    user.name = mongo_user['name']
-                db.flush()
+        valid = mongo_user is not None
+        if not valid and user:
+            # S3 – Upstream auth failed (e.g. inactive or revoked). Invalidate local active flag.
+            user.is_active = False
+            db.commit()
+    else:
+        # Local account: verify against local scrypt hash
+        valid = verify_password(payload.password, user.password_hash if user else DUMMY_PASSWORD)
 
-            membership = db.get(Membership, (org.id, user.id))
-            if not membership:
-                # S2 – Only provision membership for roles in the explicit allowlist
-                allowed_roles = {'admin', 'agent', 'viewer'}
-                raw_role = mongo_user.get('role', 'viewer')
-                safe_role = raw_role if raw_role in allowed_roles else 'viewer'
-                membership = Membership(
-                    organization_id=org.id,
-                    user_id=user.id,
-                    role=safe_role,
-                    status='active'
-                )
-                db.add(membership)
+    if mongo_user:
+        user = db.scalar(select(User).where(User.email == mongo_user['email']))
+        if not user:
+            user = User(
+                name=mongo_user['name'],
+                email=mongo_user['email'],
+                # S3 – Random unguessable hash for federated users; auth is always delegated to Mongo
+                password_hash=hash_password(secrets.token_urlsafe(32)),
+                is_active=True
+            )
+            db.add(user)
+            db.flush()
+        else:
+            user.is_active = True
+            if mongo_user.get('name') and not user.name:
+                user.name = mongo_user['name']
+            db.flush()
+
+        membership_check = db.get(Membership, (org.id, user.id))
+        allowed_roles = {'admin', 'agent', 'viewer'}
+        raw_role = mongo_user.get('role', 'viewer')
+        safe_role = raw_role if raw_role in allowed_roles else 'viewer'
+        if not membership_check:
+            # S2 – Only provision membership for roles in the explicit allowlist
+            membership_check = Membership(
+                organization_id=org.id,
+                user_id=user.id,
+                role=safe_role,
+                status='active'
+            )
+            db.add(membership_check)
+            db.flush()
+        else:
+            if membership_check.role != safe_role:
+                membership_check.role = safe_role
                 db.flush()
-            valid = True
+        valid = True
 
     membership = db.get(Membership, (org.id, user.id)) if org and user else None
     if not valid or not user or not user.is_active or not membership or membership.status != 'active':
@@ -354,6 +369,13 @@ def revoke_key(website_id: str, ctx=Depends(admin), db=Depends(get_db)):
     return {'ok': True}
 
 
+def agent_scope(ctx) -> str | None:
+    """S4 – Returns the user_id to scope leads to for agent role, or None for admin/viewer.
+    Agents always see only their own assigned leads across ALL endpoints.
+    This is the single authoritative place to enforce that policy."""
+    return ctx['user_id'] if ctx['role'] == 'agent' else None
+
+
 def lead_query(ctx, q='', status='', website_id='', source='', assigned_to='', date_from=None, date_to=None):
     query = select(Lead).where(Lead.organization_id == ctx['organization_id'], Lead.deleted_at.is_(None))
     if q:
@@ -377,12 +399,9 @@ def lead_query(ctx, q='', status='', website_id='', source='', assigned_to='', d
 def leads(q: str = '', status: str = '', website_id: str = '', source: str = '', assigned_to: str = '', pipeline: bool = False, date_from: datetime | None = None, date_to: datetime | None = None, page: int = 1, page_size: int = 20, sort: str = 'newest', ctx=Depends(context), db=Depends(get_db)):
     if page < 1 or not 1 <= page_size <= 100:
         raise HTTPException(422, 'Invalid pagination')
-    
-    # In deal pipeline: admin sees all leads (or filters by agent); agent strictly sees only their assigned leads
-    eff_assigned_to = assigned_to
-    if pipeline and ctx['role'] == 'agent':
-        eff_assigned_to = ctx['user_id']
-
+    # S4 – agent scope applied always, not just in pipeline mode.
+    # agent_scope() returns the agent's own user_id; admin/viewer get None (no restriction).
+    eff_assigned_to = agent_scope(ctx) or assigned_to
     query = lead_query(ctx, q, status, website_id, source, eff_assigned_to, date_from, date_to)
     count = db.scalar(select(func.count()).select_from(query.subquery()))
     order = {'newest': Lead.created_at.desc(), 'oldest': Lead.created_at.asc(), 'name': Lead.full_name.asc()}.get(sort)
@@ -481,6 +500,9 @@ def export_leads(
 @app.get('/api/v1/leads/{lead_id}')
 def get_lead(lead_id: str, ctx=Depends(context), db=Depends(get_db)):
     lead = scoped(db, Lead, lead_id, ctx['organization_id'])
+    # S4 – agents may only read leads they are assigned to, or unaccepted leads awaiting claim.
+    if ctx['role'] == 'agent' and lead.assigned_to != ctx['user_id'] and lead.accepted_by is not None:
+        raise HTTPException(403, 'Access to this lead is restricted to its assigned agent.')
     events = db.scalars(select(Activity).where(Activity.organization_id == ctx['organization_id'], Activity.lead_id == lead.id).order_by(Activity.created_at.desc()))
     return {**serialize(lead), 'activities': [serialize(e) for e in events]}
 
@@ -516,6 +538,9 @@ def accept_lead(lead_id: str, ctx=Depends(writer), db=Depends(get_db)):
 @app.patch('/api/v1/leads/{lead_id}')
 def edit_lead(lead_id: str, payload: dict, ctx=Depends(writer), db=Depends(get_db)):
     lead = scoped(db, Lead, lead_id, ctx['organization_id'], lock=True)
+    # S4 – agents may only edit leads assigned to them.
+    if ctx['role'] == 'agent' and lead.assigned_to != ctx['user_id']:
+        raise HTTPException(403, 'Access to this lead is restricted to its assigned agent.')
     unknown = set(payload) - set(LeadInput.model_fields)
     if unknown:
         raise HTTPException(422, 'Unsupported lead fields')
@@ -577,7 +602,10 @@ def delete_lead(lead_id: str, ctx=Depends(admin), db=Depends(get_db)):
 
 @app.post('/api/v1/leads/{lead_id}/notes', status_code=201)
 def note(lead_id: str, payload: NoteInput, ctx=Depends(writer), db=Depends(get_db)):
-    scoped(db, Lead, lead_id, ctx['organization_id'])
+    lead = scoped(db, Lead, lead_id, ctx['organization_id'])
+    # S4 – agents may only add notes to leads assigned to them.
+    if ctx['role'] == 'agent' and lead.assigned_to != ctx['user_id']:
+        raise HTTPException(403, 'Access to this lead is restricted to its assigned agent.')
     activity(db, ctx['organization_id'], lead_id, ctx['user_id'], 'note', payload.description)
     db.commit()
     return {'ok': True}
@@ -670,12 +698,18 @@ def follow_ups(status: str = 'open', ctx=Depends(context), db=Depends(get_db)):
     query = select(FollowUp, Lead.full_name).join(Lead, (Lead.id == FollowUp.lead_id) & (Lead.organization_id == FollowUp.organization_id)).where(FollowUp.organization_id == ctx['organization_id'], Lead.deleted_at.is_(None))
     if status:
         query = query.where(FollowUp.status == status)
+    # S4 – agents see only follow-ups for leads assigned to them.
+    if ctx['role'] == 'agent':
+        query = query.where(Lead.assigned_to == ctx['user_id'])
     return [{**serialize(task), 'lead_name': name} for task, name in db.execute(query.order_by(FollowUp.due_at))]
 
 
 @app.post('/api/v1/follow-ups', status_code=201)
 def add_follow_up(payload: FollowUpInput, ctx=Depends(writer), db=Depends(get_db)):
-    scoped(db, Lead, payload.lead_id, ctx['organization_id'])
+    lead = scoped(db, Lead, payload.lead_id, ctx['organization_id'])
+    # S4 – agents may only schedule follow-ups for leads assigned to them.
+    if ctx['role'] == 'agent' and lead.assigned_to != ctx['user_id']:
+        raise HTTPException(403, 'Access to this lead is restricted to its assigned agent.')
     check_assignee(db, ctx['organization_id'], payload.assigned_to)
     task = FollowUp(**payload.model_dump(), organization_id=ctx['organization_id'])
     db.add(task)
@@ -689,6 +723,11 @@ def add_follow_up(payload: FollowUpInput, ctx=Depends(writer), db=Depends(get_db
 @app.patch('/api/v1/follow-ups/{task_id}')
 def edit_follow_up(task_id: str, payload: FollowUpUpdate, ctx=Depends(writer), db=Depends(get_db)):
     task = scoped(db, FollowUp, task_id, ctx['organization_id'], lock=True)
+    # S4 – agents may only update follow-ups for leads assigned to them.
+    if ctx['role'] == 'agent':
+        lead = scoped(db, Lead, task.lead_id, ctx['organization_id'])
+        if lead.assigned_to != ctx['user_id']:
+            raise HTTPException(403, 'Access to this follow-up is restricted to its assigned agent.')
     task.status = payload.status
     db.flush()
     sync_next_follow_up(db, ctx['organization_id'], task.lead_id)
@@ -745,7 +784,9 @@ def import_errors(job_id: str, ctx=Depends(context), db=Depends(get_db)):
 
 @app.get('/api/v1/dashboard/summary')
 def dashboard(website_id: str = '', source: str = '', assigned_to: str = '', date_from: datetime | None = None, date_to: datetime | None = None, ctx=Depends(context), db=Depends(get_db)):
-    query = lead_query(ctx, website_id=website_id, source=source, assigned_to=assigned_to, date_from=date_from, date_to=date_to)
+    # S4 – agents see only their assigned leads in dashboard stats too.
+    eff_assigned_to = agent_scope(ctx) or assigned_to
+    query = lead_query(ctx, website_id=website_id, source=source, assigned_to=eff_assigned_to, date_from=date_from, date_to=date_to)
     rows = db.scalars(query).all()
     status_counts = {s: sum(l.status == s for l in rows) for s in ['new', 'contacted', 'qualified', 'converted', 'lost']}
     # Due today is defined in the business timezone, Asia/Kolkata.
