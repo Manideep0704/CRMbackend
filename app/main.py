@@ -370,31 +370,51 @@ def export_leads(
     ctx=Depends(admin),
     db=Depends(get_db)
 ):
+    from zoneinfo import ZoneInfo
+    ist = ZoneInfo('Asia/Kolkata')
     query = lead_query(ctx, q=q, status=status, website_id=website_id, source=source, date_from=date_from, date_to=date_to)
     leads = db.scalars(query.order_by(Lead.created_at.desc())).all()
     output = io.StringIO()
     writer = csv.writer(output)
     writer.writerow([
-        'Lead ID', 'Full Name', 'Email', 'Phone', 'Company / Clinic',
-        'Inquiry Type', 'Status', 'Priority', 'Source', 'Website',
-        'Next Follow-Up', 'Created At'
+        'S.No', 'Lead ID', 'Full Name', 'Phone', 'Email',
+        'Company / Clinic', 'Inquiry / Looking For', 'Status',
+        'Priority', 'Source', 'Website', 'Assigned To',
+        'Next Follow-Up', 'Created Date'
     ])
     websites_dict = {w.id: w.name for w in db.scalars(select(Website).where(Website.organization_id == ctx['organization_id']))}
-    for lead in leads:
+    members_dict = {u.id: u.name for u in db.scalars(select(User).join(Membership, (Membership.user_id == User.id) & (Membership.organization_id == ctx['organization_id'])))}
+
+    for idx, lead in enumerate(leads, 1):
+        clean_phone = (lead.phone or '').replace("'", "").strip()
+        formatted_source = 'Website Form' if lead.source == 'website' else 'Manual Entry' if lead.source == 'manual' else (lead.source or '').upper()
+        next_follow = '-'
+        if lead.next_follow_up_at:
+            dt_fu = lead.next_follow_up_at if lead.next_follow_up_at.tzinfo else lead.next_follow_up_at.replace(tzinfo=timezone.utc)
+            next_follow = dt_fu.astimezone(ist).strftime('%d-%b-%Y %I:%M %p')
+
+        created_str = '-'
+        if lead.created_at:
+            dt_cr = lead.created_at if lead.created_at.tzinfo else lead.created_at.replace(tzinfo=timezone.utc)
+            created_str = dt_cr.astimezone(ist).strftime('%d-%b-%Y %I:%M %p')
+
         writer.writerow([
-            lead.id,
-            safe_csv_cell(lead.full_name or ''),
-            safe_csv_cell(lead.email or ''),
-            safe_csv_cell(lead.phone or ''),
-            safe_csv_cell(lead.company_name or ''),
-            safe_csv_cell(lead.inquiry_type or ''),
-            lead.status,
-            lead.priority,
-            lead.source,
-            safe_csv_cell(websites_dict.get(lead.website_id, '')),
-            lead.next_follow_up_at.isoformat() if lead.next_follow_up_at else '',
-            lead.created_at.isoformat() if lead.created_at else ''
+            idx,
+            f"TL-{lead.id[:8].upper()}",
+            lead.full_name or '',
+            clean_phone,
+            lead.email or '',
+            lead.company_name or '',
+            lead.inquiry_type or '',
+            (lead.status or '').capitalize(),
+            (lead.priority or '').capitalize(),
+            formatted_source,
+            websites_dict.get(lead.website_id, 'Timely Health Digital'),
+            members_dict.get(lead.assigned_to, 'Unassigned'),
+            next_follow,
+            created_str
         ])
+
     audit(db, ctx, 'leads.exported', f'count:{len(leads)}')
     filename = f"timely-leads-export-{datetime.now().strftime('%Y%m%d-%H%M')}.csv"
     return Response(
