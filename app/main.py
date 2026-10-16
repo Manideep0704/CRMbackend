@@ -359,6 +359,54 @@ def add_lead(payload: LeadInput, ctx=Depends(writer), db=Depends(get_db)):
     return serialize(lead)
 
 
+@app.get('/api/v1/leads/export')
+def export_leads(
+    q: str = '',
+    status: str = '',
+    website_id: str = '',
+    source: str = '',
+    date_from: datetime | None = None,
+    date_to: datetime | None = None,
+    ctx=Depends(admin),
+    db=Depends(get_db)
+):
+    query = lead_query(ctx, q=q, status=status, website_id=website_id, source=source, date_from=date_from, date_to=date_to)
+    leads = db.scalars(query.order_by(Lead.created_at.desc())).all()
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow([
+        'Lead ID', 'Full Name', 'Email', 'Phone', 'Company / Clinic',
+        'Inquiry Type', 'Status', 'Priority', 'Source', 'Website',
+        'Next Follow-Up', 'Created At'
+    ])
+    websites_dict = {w.id: w.name for w in db.scalars(select(Website).where(Website.organization_id == ctx['organization_id']))}
+    for lead in leads:
+        writer.writerow([
+            lead.id,
+            safe_csv_cell(lead.full_name or ''),
+            safe_csv_cell(lead.email or ''),
+            safe_csv_cell(lead.phone or ''),
+            safe_csv_cell(lead.company_name or ''),
+            safe_csv_cell(lead.inquiry_type or ''),
+            lead.status,
+            lead.priority,
+            lead.source,
+            safe_csv_cell(websites_dict.get(lead.website_id, '')),
+            lead.next_follow_up_at.isoformat() if lead.next_follow_up_at else '',
+            lead.created_at.isoformat() if lead.created_at else ''
+        ])
+    audit(db, ctx, 'leads.exported', f'count:{len(leads)}')
+    filename = f"timely-leads-export-{datetime.now().strftime('%Y%m%d-%H%M')}.csv"
+    return Response(
+        output.getvalue(),
+        media_type='text/csv',
+        headers={
+            'Content-Disposition': f'attachment; filename="{filename}"',
+            'Content-Type': 'text/csv; charset=utf-8'
+        }
+    )
+
+
 @app.get('/api/v1/leads/{lead_id}')
 def get_lead(lead_id: str, ctx=Depends(context), db=Depends(get_db)):
     lead = scoped(db, Lead, lead_id, ctx['organization_id'])
@@ -409,11 +457,17 @@ def edit_lead(lead_id: str, payload: dict, ctx=Depends(writer), db=Depends(get_d
 
 
 @app.delete('/api/v1/leads/{lead_id}')
-def delete_lead(lead_id: str, ctx=Depends(writer), db=Depends(get_db)):
+def delete_lead(lead_id: str, ctx=Depends(admin), db=Depends(get_db)):
     lead = scoped(db, Lead, lead_id, ctx['organization_id'], lock=True)
     lead.deleted_at = now()
     db.execute(update(FollowUp).where(FollowUp.organization_id == ctx['organization_id'], FollowUp.lead_id == lead.id).values(status='completed'))
     audit(db, ctx, 'lead.deleted', lead.id)
+    if lead.external_submission_id:
+        try:
+            from .mongo import update_lead_in_mongo
+            update_lead_in_mongo(lead.external_submission_id, 'deleted')
+        except Exception:
+            pass
     db.commit()
     return {'ok': True}
 
