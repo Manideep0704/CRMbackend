@@ -117,6 +117,8 @@ def authenticate_attendance_user(identifier: str, password: str):
         ident = identifier.strip()
         ident_pattern = {'$regex': f'^{re.escape(ident)}$', '$options': 'i'}
 
+        import secrets as _sec
+
         # 1. Check 'admins' collection
         admin = db_mongo['admins'].find_one({
             '$or': [
@@ -125,12 +127,17 @@ def authenticate_attendance_user(identifier: str, password: str):
                 {'name': ident_pattern}
             ]
         })
-        if admin and str(admin.get('password')) == str(password):
+        if admin and _sec.compare_digest(str(admin.get('password') or ''), str(password or '')):
+            admin_status = str(admin.get('status', 'active')).strip().lower()
+            if admin_status != 'active':
+                print(f"[MongoDB Auth] Admin {admin.get('name')} is inactive in attendanceDB. Denying login.")
+                return None
             return {
                 '_id': str(admin.get('_id', '')),
                 'email': (admin.get('email') or f'{ident}@timelyhealth.in').lower(),
                 'name': admin.get('name') or 'Admin',
                 'role': 'admin',
+                'status': admin_status,
                 'entitled_org_slug': 'timely-health'
             }
 
@@ -142,17 +149,16 @@ def authenticate_attendance_user(identifier: str, password: str):
                 {'phone': ident}
             ]
         })
-        if emp and str(emp.get('password')) == str(password):
+        if emp and _sec.compare_digest(str(emp.get('password') or ''), str(password or '')):
             emp_status = str(emp.get('status', 'active')).strip().lower()
             if emp_status != 'active':
                 print(f"[MongoDB Auth] Employee {emp.get('name')} is inactive in attendanceDB. Denying login.")
                 return None
             emp_role = str(emp.get('role', '')).lower()
             emp_dept = str(emp.get('department', '')).lower()
-            emp_email = str(emp.get('email', '')).lower()
             if any(k in emp_role for k in ['admin', 'director', 'general manager']):
                 crm_role = 'admin'
-            elif 'sales' in emp_dept or 'manideepreddy2477@gmail.com' in emp_email:
+            elif 'sales' in emp_dept:
                 crm_role = 'agent'
             else:
                 crm_role = 'viewer' # Only sales department persons become agents!
@@ -172,14 +178,13 @@ def authenticate_attendance_user(identifier: str, password: str):
                 {'phone': ident}
             ]
         })
-        if empl and str(empl.get('password')) == str(password):
+        if empl and _sec.compare_digest(str(empl.get('password') or ''), str(password or '')):
             empl_status = str(empl.get('status', 'active')).strip().lower()
             if empl_status != 'active':
                 print(f"[MongoDB Auth] Empl {empl.get('name')} is inactive in attendanceDB. Denying login.")
                 return None
             empl_dept = str(empl.get('department', '')).lower()
-            empl_email = str(empl.get('email', '')).lower()
-            crm_role = 'agent' if ('sales' in empl_dept or 'manideepreddy2477@gmail.com' in empl_email) else 'viewer'
+            crm_role = 'agent' if 'sales' in empl_dept else 'viewer'
             return {
                 '_id': str(empl.get('_id', '')),
                 'email': (empl.get('email') or f'{ident}@timelyhealth.in').lower(),
@@ -246,22 +251,23 @@ def sync_sales_agents_from_mongo():
             'status': {'$regex': '^active$', '$options': 'i'}
         }))
 
-        # Test inclusion: include manideepreddy2477@gmail.com as agent without modifying MongoDB
-        test_emp = db_mongo['employees'].find_one({
-            'email': {'$regex': 'manideepreddy2477@gmail.com', '$options': 'i'}
-        })
-        if test_emp and not any((e.get('email') or '').lower() == 'manideepreddy2477@gmail.com' for e in active_sales_emps):
-            active_sales_emps.append(test_emp)
-
         active_sales_emails = set()
 
-        # Query inactive sales employees
+        # Query inactive employees across supported collections for complete deactivation propagation
         inactive_sales_emps = list(db_mongo['employees'].find({
             'department': {'$regex': 'sales', '$options': 'i'},
             'status': {'$regex': '^(?!active$).*$', '$options': 'i'}
         }))
-        inactive_sales_emails = {
-            (e.get('email') or '').lower().strip() for e in inactive_sales_emps if (e.get('email') or '').strip()
+        inactive_admins = list(db_mongo['admins'].find({
+            'status': {'$regex': '^(?!active$).*$', '$options': 'i'}
+        }))
+        inactive_empls = list(db_mongo['empls'].find({
+            'status': {'$regex': '^(?!active$).*$', '$options': 'i'}
+        }))
+        inactive_emails = {
+            (e.get('email') or '').lower().strip()
+            for e in (inactive_sales_emps + inactive_admins + inactive_empls)
+            if (e.get('email') or '').strip()
         }
 
         with SessionLocal() as db_crm:
@@ -275,15 +281,46 @@ def sync_sales_agents_from_mongo():
                     continue
                 active_sales_emails.add(email)
                 name = (emp.get('name') or 'Sales Agent').strip()
-                # S3 – Never copy upstream plaintext or hashed passwords into CRM local database.
-                # Always generate an unguessable random secret so local login is impossible.
-                # Federated accounts must authenticate exclusively against attendanceDB.
                 import secrets as _sec
                 random_hash = hash_password(_sec.token_urlsafe(32))
-                subject_id = str(emp.get('_id', ''))
+                subject_id = str(emp.get('_id', '')).strip()
 
-                user = db_crm.scalar(select(User).where(User.email == email))
-                if not user:
+                # R5 – Subject-first resolution and identity collision avoidance
+                user_by_sub = db_crm.scalar(
+                    select(User).where(
+                        User.auth_provider == 'attendance',
+                        User.auth_subject == subject_id
+                    )
+                ) if subject_id else None
+                user_by_email = db_crm.scalar(select(User).where(User.email == email))
+
+                if user_by_sub and user_by_email and user_by_sub.id != user_by_email.id:
+                    print(f"[Sales Sync] Skipping {email}: subject {subject_id} collision with different user.")
+                    continue
+
+                if user_by_sub:
+                    user = user_by_sub
+                    if user.email != email:
+                        user.email = email
+                    if name and not user.name:
+                        user.name = name
+                    user.password_hash = random_hash
+                    db_crm.flush()
+                elif user_by_email:
+                    if user_by_email.auth_provider == 'local':
+                        print(f"[Sales Sync] Skipping {email}: matches local account.")
+                        continue
+                    if user_by_email.auth_subject and user_by_email.auth_subject != subject_id:
+                        print(f"[Sales Sync] Skipping {email}: external subject mismatch.")
+                        continue
+                    user = user_by_email
+                    user.auth_provider = 'attendance'
+                    user.auth_subject = subject_id
+                    user.password_hash = random_hash
+                    if name and not user.name:
+                        user.name = name
+                    db_crm.flush()
+                else:
                     user = User(
                         name=name,
                         email=email,
@@ -295,15 +332,11 @@ def sync_sales_agents_from_mongo():
                     )
                     db_crm.add(user)
                     db_crm.flush()
-                else:
-                    if name and not user.name:
-                        user.name = name
-                    user.is_active = True
-                    user.auth_provider = 'attendance'
-                    user.auth_subject = subject_id
-                    # Overwrite any legacy cached password hash with random unguessable secret
-                    user.password_hash = random_hash
-                    db_crm.flush()
+
+                # R6 – Respect local suspension by CRM admin: do not reactivate locally suspended accounts
+                if not user.is_active:
+                    print(f"[Sales Sync] Skipping membership for suspended user {email}")
+                    continue
 
                 membership = db_crm.get(Membership, (org.id, user.id))
                 if not membership:
@@ -319,11 +352,11 @@ def sync_sales_agents_from_mongo():
                     membership.status = 'active'
                 db_crm.flush()
 
-            # For any inactive sales employees:
+            # For any inactive directory identities:
             # Mark membership inactive, revoke all active sessions, and unassign leads
-            for inact_email in inactive_sales_emails:
+            for inact_email in inactive_emails:
                 u = db_crm.scalar(select(User).where(User.email == inact_email))
-                if u:
+                if u and u.auth_provider == 'attendance':
                     u.is_active = False
                     # S5 – Revoke all sessions for deactivated user
                     revoke_user_sessions(db_crm, u.id)
@@ -334,7 +367,7 @@ def sync_sales_agents_from_mongo():
                     if m:
                         m.status = 'inactive'
                     db_crm.flush()
-                    print(f"[Sales Sync] Deactivated inactive sales employee {u.name} ({u.email}) and revoked sessions.")
+                    print(f"[Directory Sync] Deactivated inactive directory user {u.name} ({u.email}) and revoked sessions.")
 
             # Ensure any other non-active-sales users currently marked as 'agent' are downgraded to 'viewer'
             memberships = db_crm.scalars(

@@ -49,7 +49,7 @@ def create_lead(db, org, data, source, actor=None, external_id=None, attribution
     if data.website_id:
         site = scoped(db, Website, data.website_id, org)
         if not values.get('assigned_to') and site.config:
-            default_assignee = site.config.get('default_assignee')
+            default_assignee = site.config.get('assigned_to') or site.config.get('default_assignee')
             if default_assignee:
                 check_assignee(db, org, default_assignee)
                 values['assigned_to'] = default_assignee
@@ -78,7 +78,7 @@ def create_lead(db, org, data, source, actor=None, external_id=None, attribution
     db.flush()
     activity(db, org, lead.id, actor, 'created', f'Lead created via {source}' + ('; possible duplicate flagged' if match else ''))
     if data.next_follow_up_at:
-        db.add(FollowUp(organization_id=org, lead_id=lead.id, assigned_to=data.assigned_to, due_at=data.next_follow_up_at, title='Scheduled follow-up'))
+        db.add(FollowUp(organization_id=org, lead_id=lead.id, assigned_to=values.get('assigned_to'), due_at=data.next_follow_up_at, title='Scheduled follow-up'))
     return lead, False
 
 

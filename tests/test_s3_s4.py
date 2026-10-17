@@ -440,3 +440,309 @@ def test_s4_shared_claim_queue_and_permissions(clients, setup):
     q_after_ids = [l['id'] for l in q_after['items']]
     assert target_id not in q_after_ids
 
+
+def test_r2_revoke_all_endpoint_with_concurrent_sessions(setup):
+    """
+    R2: HTTP endpoint regression for POST /api/v1/auth/revoke-all.
+    Verifies:
+    1. Two concurrent sessions (T1, T2) can be created and work simultaneously.
+    2. Calling /api/v1/auth/revoke-all via T1 succeeds without NameError.
+    3. Both T1 and T2 are immediately revoked and rejected on subsequent requests.
+    4. A new login issues T3 which works, while T1 and T2 remain rejected (no token revival).
+    """
+    factory, ids = setup
+    client = TestClient(app, headers={'X-Timely-Request': '1', 'origin': 'http://localhost:3000'})
+    limiter.buckets.clear()
+
+    test_email = 'concurrent_revoke@test.com'
+    test_pass = 'StrongPass12345!'
+    with factory() as db:
+        org = db.scalar(select(Organization).where(Organization.slug == 'timely-health'))
+        u = User(
+            name='Concurrent User',
+            email=test_email,
+            password_hash=hash_password(test_pass),
+            is_active=True,
+            auth_provider='local',
+            token_version=1
+        )
+        db.add(u)
+        db.flush()
+        db.add(Membership(organization_id=org.id, user_id=u.id, role='agent', status='active'))
+        db.commit()
+
+    # Session 1 (T1)
+    login_1 = client.post(ROOT + '/auth/login', json={
+        'email': test_email,
+        'password': test_pass,
+        'organization_slug': 'timely-health'
+    })
+    assert login_1.status_code == 200
+    t1 = login_1.cookies.get('timely_session')
+
+    # Session 2 (T2)
+    login_2 = client.post(ROOT + '/auth/login', json={
+        'email': test_email,
+        'password': test_pass,
+        'organization_slug': 'timely-health'
+    })
+    assert login_2.status_code == 200
+    t2 = login_2.cookies.get('timely_session')
+    assert t1 != t2
+
+    # Both sessions work
+    assert client.get(ROOT + '/organizations/me', cookies={'timely_session': t1}).status_code == 200
+    assert client.get(ROOT + '/organizations/me', cookies={'timely_session': t2}).status_code == 200
+
+    # Call /api/v1/auth/revoke-all using Session 1 (T1)
+    rev_res = client.post(
+        ROOT + '/auth/revoke-all',
+        cookies={'timely_session': t1},
+        headers={'X-Timely-Request': '1', 'origin': 'http://localhost:3000'}
+    )
+    assert rev_res.status_code == 200
+    assert rev_res.json()['ok'] is True
+
+    # Both T1 and T2 must now be rejected
+    assert client.get(ROOT + '/organizations/me', cookies={'timely_session': t1}).status_code in (401, 403)
+    assert client.get(ROOT + '/organizations/me', cookies={'timely_session': t2}).status_code in (401, 403)
+
+    # User logs in again -> gets T3
+    limiter.buckets.clear()
+    login_3 = client.post(ROOT + '/auth/login', json={
+        'email': test_email,
+        'password': test_pass,
+        'organization_slug': 'timely-health'
+    })
+    assert login_3.status_code == 200
+    t3 = login_3.cookies.get('timely_session')
+
+    # T3 works
+    assert client.get(ROOT + '/organizations/me', cookies={'timely_session': t3}).status_code == 200
+
+    # T1 and T2 remain permanently rejected
+    assert client.get(ROOT + '/organizations/me', cookies={'timely_session': t1}).status_code == 401
+    assert client.get(ROOT + '/organizations/me', cookies={'timely_session': t2}).status_code == 401
+
+
+def test_r4_legacy_untagged_user_fails_closed_during_outage(setup):
+    """
+    R4: Acceptance test for legacy federated account during provider outage:
+    A legacy external user cannot use the old local password during directory outage.
+    """
+    factory, ids = setup
+    client = TestClient(app, headers={'X-Timely-Request': '1', 'origin': 'http://localhost:3000'})
+    limiter.buckets.clear()
+
+    legacy_email = 'legacy_sales@timelyhealth.in'
+    legacy_pass = 'OldLegacyPassword123!'
+    with factory() as db:
+        org = db.scalar(select(Organization).where(Organization.slug == 'timely-health'))
+        u = User(
+            name='Legacy Sales Agent',
+            email=legacy_email,
+            password_hash=hash_password(legacy_pass),
+            is_active=True,
+            auth_provider=None,  # Legacy untagged
+            token_version=1
+        )
+        db.add(u)
+        db.flush()
+        db.add(Membership(organization_id=org.id, user_id=u.id, role='agent', status='active'))
+        db.commit()
+
+    # Provider outage: provider_ok = False
+    with patch('app.mongo.check_attendance_user_status', return_value=(False, False)):
+        limiter.buckets.clear()
+        res = client.post(ROOT + '/auth/login', json={
+            'email': legacy_email,
+            'password': legacy_pass,
+            'organization_slug': 'timely-health'
+        })
+        assert res.status_code == 503, "Legacy untagged corporate account must fail closed with 503 during outage!"
+
+
+def test_r5_external_subject_collision_rejection(setup):
+    """
+    R5: External subject identity binding & collision rejection.
+    Verifies:
+    1. Initial federated login binds auth_subject to account.
+    2. A subsequent login with the same email but a different external subject is rejected (HTTP 403).
+    3. The bound auth_subject in the database is not overwritten.
+    """
+    factory, ids = setup
+    client = TestClient(app, headers={'X-Timely-Request': '1', 'origin': 'http://localhost:3000'})
+    limiter.buckets.clear()
+
+    email = 'bound_agent@timelyhealth.in'
+    original_sub = 'mongo-sub-original-123'
+    attacker_sub = 'mongo-sub-attacker-456'
+
+    mock_original_user = {
+        '_id': original_sub,
+        'email': email,
+        'name': 'Legitimate Agent',
+        'role': 'agent',
+        'status': 'active',
+        'entitled_org_slug': 'timely-health'
+    }
+
+    # 1. Login with legitimate subject -> account created and bound
+    with patch('app.mongo.check_attendance_user_status', return_value=(True, True)), \
+         patch('app.mongo.authenticate_attendance_user', return_value=mock_original_user):
+        limiter.buckets.clear()
+        res = client.post(ROOT + '/auth/login', json={
+            'email': email,
+            'password': 'AnyValidPassword',
+            'organization_slug': 'timely-health'
+        })
+        assert res.status_code == 200
+
+    with factory() as db:
+        u = db.scalar(select(User).where(User.email == email))
+        assert u.auth_subject == original_sub
+
+    # 2. Login attempt with different subject for same email -> rejected
+    mock_attacker_user = {
+        '_id': attacker_sub,
+        'email': email,
+        'name': 'Attacker Impersonator',
+        'role': 'agent',
+        'status': 'active',
+        'entitled_org_slug': 'timely-health'
+    }
+
+    with patch('app.mongo.check_attendance_user_status', return_value=(True, True)), \
+         patch('app.mongo.authenticate_attendance_user', return_value=mock_attacker_user):
+        limiter.buckets.clear()
+        res = client.post(ROOT + '/auth/login', json={
+            'email': email,
+            'password': 'AnyValidPassword',
+            'organization_slug': 'timely-health'
+        })
+        assert res.status_code == 403
+        assert 'mismatch' in res.json().get('detail', '').lower()
+
+    # Verify database subject remains intact
+    with factory() as db:
+        u = db.scalar(select(User).where(User.email == email))
+        assert u.auth_subject == original_sub
+
+
+def test_r6_local_suspension_overrides_provider_status_and_inactive_admin_denied(setup):
+    """
+    R6: Local suspension policy and directory admin active status checks.
+    Verifies:
+    1. A locally suspended CRM user cannot log in via external provider (HTTP 403).
+    2. Local suspension is preserved (is_active remains False).
+    3. An inactive administrator in MongoDB is denied authentication.
+    """
+    factory, ids = setup
+    client = TestClient(app, headers={'X-Timely-Request': '1', 'origin': 'http://localhost:3000'})
+    limiter.buckets.clear()
+
+    email = 'suspended_agent@timelyhealth.in'
+    sub_id = 'mongo-sub-suspended-789'
+    with factory() as db:
+        org = db.scalar(select(Organization).where(Organization.slug == 'timely-health'))
+        u = User(
+            name='Suspended Agent',
+            email=email,
+            password_hash=hash_password('random_hash'),
+            is_active=False,  # Explicitly suspended locally by CRM admin
+            auth_provider='attendance',
+            auth_subject=sub_id,
+            token_version=1
+        )
+        db.add(u)
+        db.flush()
+        db.add(Membership(organization_id=org.id, user_id=u.id, role='agent', status='active'))
+        db.commit()
+
+    mock_user = {
+        '_id': sub_id,
+        'email': email,
+        'name': 'Suspended Agent',
+        'role': 'agent',
+        'status': 'active',
+        'entitled_org_slug': 'timely-health'
+    }
+
+    with patch('app.mongo.check_attendance_user_status', return_value=(True, True)), \
+         patch('app.mongo.authenticate_attendance_user', return_value=mock_user):
+        limiter.buckets.clear()
+        res = client.post(ROOT + '/auth/login', json={
+            'email': email,
+            'password': 'AnyPassword',
+            'organization_slug': 'timely-health'
+        })
+        assert res.status_code == 403
+        assert 'suspended' in res.json().get('detail', '').lower()
+
+    with factory() as db:
+        u = db.scalar(select(User).where(User.email == email))
+        assert u.is_active is False
+
+    # Check MongoDB inactive admin denial
+    from app.mongo import authenticate_attendance_user
+    mock_mongo = {
+        'admins': type('MockColl', (), {
+            'find_one': lambda self, q: {'_id': 'adm1', 'name': 'Old Admin', 'password': 'SecretPassword', 'status': 'inactive'}
+        })()
+    }
+    with patch('app.mongo.get_mongo_db', return_value=mock_mongo):
+        auth_res = authenticate_attendance_user('Old Admin', 'SecretPassword')
+        assert auth_res is None, "Inactive admin in MongoDB must be denied login!"
+
+
+def test_r7_website_configured_assignment_across_ingestion(clients, setup):
+    """
+    R7: Configured website assignment consistency.
+    Verifies:
+    1. Website created with assigned_to via normal API path.
+    2. Actorless website ingestion resolves assigned_to from website config.
+    3. Associated FollowUp task is assigned to the configured agent.
+    """
+    admin_c = clients['admin']
+    factory, ids = setup
+    agent_id = ids['agent@test.in']
+
+    # 1. Create website via normal API endpoint with assigned_to configured
+    ws_res = admin_c.post(ROOT + '/websites', json={
+        'name': 'Configured Assignment Test Site',
+        'domain': 'testassign.com',
+        'status': 'active',
+        'assigned_to': agent_id
+    })
+    assert ws_res.status_code == 201
+    website_id = ws_res.json()['id']
+
+    # 2. Ingest lead without passing assigned_to (e.g. fallback sync / direct sync)
+    from app.services import create_lead
+    from app.schemas import LeadInput
+    from datetime import datetime, timezone, timedelta
+
+    follow_up_time = datetime.now(timezone.utc) + timedelta(days=2)
+    with factory() as db:
+        org = db.scalar(select(Organization).where(Organization.slug == 'timely-health'))
+        lead_in = LeadInput(
+            full_name='Configured Assignee Lead',
+            email='config.lead@test.com',
+            phone='9988776655',
+            website_id=website_id,
+            next_follow_up_at=follow_up_time
+        )
+        lead, _ = create_lead(db, org.id, lead_in, 'website', external_id='ext-assign-test-1')
+        db.commit()
+        lead_id = lead.id
+
+    # 3. Verify lead and follow-up assignment
+    with factory() as db:
+        saved_lead = db.get(Lead, lead_id)
+        assert saved_lead.assigned_to == agent_id, f"Expected lead to be assigned to {agent_id}, got {saved_lead.assigned_to}"
+
+        saved_fu = db.scalar(select(FollowUp).where(FollowUp.lead_id == lead_id))
+        assert saved_fu is not None
+        assert saved_fu.assigned_to == agent_id, f"Expected follow-up to be assigned to {agent_id}, got {saved_fu.assigned_to}"
+
+

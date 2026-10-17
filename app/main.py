@@ -19,7 +19,7 @@ from .db import get_db, now
 from .imports import MAX_BYTES, commit_job, parse_file, preview_job, safe_csv_cell
 from .models import Activity, AuditLog, AuthSession, FollowUp, ImportErrorRow, ImportJob, Lead, Membership, Organization, User, Website, WebsiteKey
 from .schemas import CommitInput, FollowUpInput, FollowUpUpdate, LeadInput, Login, MembershipInput, MergeInput, NoteInput, WebsiteInput
-from .security import DUMMY_PASSWORD, admin, context, digest, hash_password, is_trusted_origin, limiter, new_session, verify_password, writer
+from .security import DUMMY_PASSWORD, admin, context, digest, hash_password, is_trusted_origin, limiter, new_session, revoke_user_sessions, verify_password, writer
 from .services import activity, audit, check_assignee, create_lead, scoped, serialize, sync_next_follow_up
 
 app = FastAPI(title='Timely CRM', version='1.0.0')
@@ -220,11 +220,15 @@ def login(payload: Login, request: Request, response: Response, db=Depends(get_d
 
     user = db.scalar(select(User).where(User.email == payload.email.lower()))
 
-    # S3 – Distinguish local vs federated accounts.
+    # S3/R4 – Distinguish local vs federated accounts.
     # Persist auth_provider: if account is federated ('attendance'), authentication MUST delegate to Mongo.
     # Provider error/absence MUST fail closed (never fall back to local password).
     from .mongo import authenticate_attendance_user, check_attendance_user_status
-    is_federated = bool(user and getattr(user, 'auth_provider', None) == 'attendance')
+    is_local_user = bool(user and getattr(user, 'auth_provider', None) == 'local')
+    is_federated = bool(
+        (user and getattr(user, 'auth_provider', None) == 'attendance')
+        or (user and getattr(user, 'auth_provider', None) is None and user.email.endswith('@timelyhealth.in') and user.email != 'admin@timelyhealth.in')
+    )
     exists_in_dir, provider_ok = check_attendance_user_status(payload.email)
     if not is_federated and exists_in_dir:
         is_federated = True
@@ -232,7 +236,7 @@ def login(payload: Login, request: Request, response: Response, db=Depends(get_d
     mongo_user = None
     if is_federated:
         if not provider_ok:
-            # S3 – Directory outage must NEVER fall back to local auth; fail closed.
+            # S3/R4 – Directory outage must NEVER fall back to local auth; fail closed.
             raise HTTPException(503, 'External authentication provider is temporarily unavailable. Please try again later.')
         mongo_user = authenticate_attendance_user(payload.email, payload.password)
         valid = mongo_user is not None
@@ -242,30 +246,59 @@ def login(payload: Login, request: Request, response: Response, db=Depends(get_d
         valid = verify_password(payload.password, user.password_hash if user else DUMMY_PASSWORD)
 
     if mongo_user:
-        user = db.scalar(select(User).where(User.email == mongo_user['email'].lower()))
-        if not user:
+        incoming_sub = str(mongo_user.get('_id', '')).strip()
+        incoming_email = mongo_user['email'].lower().strip()
+
+        # R5 – Subject-first identity resolution and collision enforcement
+        user_by_sub = db.scalar(
+            select(User).where(
+                User.auth_provider == 'attendance',
+                User.auth_subject == incoming_sub
+            )
+        ) if incoming_sub else None
+
+        user_by_email = db.scalar(
+            select(User).where(User.email == incoming_email)
+        )
+
+        if user_by_sub and user_by_email and user_by_sub.id != user_by_email.id:
+            raise HTTPException(403, 'Identity collision: external subject and email belong to different accounts.')
+
+        if user_by_sub:
+            user = user_by_sub
+            if user.email != incoming_email:
+                user.email = incoming_email
+        elif user_by_email:
+            if user_by_email.auth_provider == 'local':
+                raise HTTPException(403, 'A local account already exists with this email. Federated linking requires administrator action.')
+            if user_by_email.auth_subject and user_by_email.auth_subject != incoming_sub:
+                raise HTTPException(403, 'External identity subject mismatch for this account.')
+            user = user_by_email
+            user.auth_provider = 'attendance'
+            user.auth_subject = incoming_sub
+        else:
             user = User(
-                name=mongo_user['name'],
-                email=mongo_user['email'].lower(),
+                name=mongo_user.get('name') or 'User',
+                email=incoming_email,
                 # S3 – Random unguessable hash for federated users; auth is always delegated to Mongo
                 password_hash=hash_password(secrets.token_urlsafe(32)),
                 is_active=True,
                 auth_provider='attendance',
-                auth_subject=str(mongo_user.get('_id', '')),
+                auth_subject=incoming_sub,
                 token_version=1
             )
             db.add(user)
             db.flush()
-        else:
-            user.is_active = True
-            user.auth_provider = 'attendance'
-            if mongo_user.get('_id'):
-                user.auth_subject = str(mongo_user['_id'])
-            # S3 – Overwrite any legacy password hash with random unguessable secret
-            user.password_hash = hash_password(secrets.token_urlsafe(32))
-            if mongo_user.get('name') and not user.name:
-                user.name = mongo_user['name']
-            db.flush()
+
+        # R6 – Local suspension policy: CRM administrator suspension strictly overrides external provider status
+        if not user.is_active:
+            raise HTTPException(403, 'Account is inactive or suspended in CRM.')
+
+        # S3 – Overwrite any legacy password hash with random unguessable secret
+        user.password_hash = hash_password(secrets.token_urlsafe(32))
+        if mongo_user.get('name') and not user.name:
+            user.name = mongo_user['name']
+        db.flush()
 
         # S2 – Check organization entitlement!
         # An attendance identity is ONLY entitled to their designated organization (e.g. 'timely-health').
