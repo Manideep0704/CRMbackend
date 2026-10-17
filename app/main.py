@@ -267,7 +267,23 @@ def root():
 @app.get('/health')
 def health(db=Depends(get_db)):
     db.execute(select(1))
-    return {'status': 'ok', 'service': 'Timely CRM'}
+    from .mongo import get_mongo_db, MONGO_URI
+    mongo_configured = bool(MONGO_URI)
+    mongo_connected = False
+    if mongo_configured:
+        try:
+            m_db = get_mongo_db()
+            mongo_connected = m_db is not None
+        except Exception:
+            mongo_connected = False
+    return {
+        'status': 'ok',
+        'service': 'Timely CRM',
+        'attendance_directory': {
+            'configured': mongo_configured,
+            'connected': mongo_connected
+        }
+    }
 
 
 @app.post('/api/v1/auth/login')
