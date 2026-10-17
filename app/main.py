@@ -29,6 +29,11 @@ _CORS_ORIGINS = [
     os.getenv('FRONTEND_ORIGIN', 'http://localhost:3000,http://127.0.0.1:3000').split(',')
     if o.strip() and o.strip() != '*'
 ]
+if os.getenv('APP_ENV') != 'production':
+    _CORS_ORIGINS.extend([
+        'http://192.168.1.103:3000',
+        'http://127.0.0.1:3000',
+    ])
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_CORS_ORIGINS,
@@ -58,35 +63,32 @@ def startup_db_init():
 
     # Defensive schema reconciliation: ensure required columns exist even on legacy unmigrated databases
     try:
-        with engine.connect() as conn:
+        with engine.begin() as conn:
             inspector = sa.inspect(conn)
             tables = set(inspector.get_table_names())
             is_sqlite = conn.dialect.name == 'sqlite'
             if 'users' in tables:
                 u_cols = {c['name'] for c in inspector.get_columns('users')}
-                with conn.begin():
-                    if 'auth_provider' not in u_cols:
-                        conn.execute(sa.text("ALTER TABLE users ADD COLUMN auth_provider VARCHAR(40)"))
-                    if 'auth_subject' not in u_cols:
-                        conn.execute(sa.text("ALTER TABLE users ADD COLUMN auth_subject VARCHAR(160)"))
-                    if 'token_version' not in u_cols:
-                        conn.execute(sa.text("ALTER TABLE users ADD COLUMN token_version INTEGER DEFAULT 1 NOT NULL"))
-                    if 'sessions_revoked_at' not in u_cols:
-                        conn.execute(sa.text("ALTER TABLE users ADD COLUMN sessions_revoked_at DATETIME" if is_sqlite else "ALTER TABLE users ADD COLUMN sessions_revoked_at TIMESTAMP WITH TIME ZONE"))
+                if 'auth_provider' not in u_cols:
+                    conn.execute(sa.text("ALTER TABLE users ADD COLUMN auth_provider VARCHAR(40)"))
+                if 'auth_subject' not in u_cols:
+                    conn.execute(sa.text("ALTER TABLE users ADD COLUMN auth_subject VARCHAR(160)"))
+                if 'token_version' not in u_cols:
+                    conn.execute(sa.text("ALTER TABLE users ADD COLUMN token_version INTEGER DEFAULT 1 NOT NULL"))
+                if 'sessions_revoked_at' not in u_cols:
+                    conn.execute(sa.text("ALTER TABLE users ADD COLUMN sessions_revoked_at DATETIME" if is_sqlite else "ALTER TABLE users ADD COLUMN sessions_revoked_at TIMESTAMP WITH TIME ZONE"))
             if 'leads' in tables:
                 l_cols = {c['name'] for c in inspector.get_columns('leads')}
-                with conn.begin():
-                    if 'accepted_by' not in l_cols:
-                        conn.execute(sa.text("ALTER TABLE leads ADD COLUMN accepted_by VARCHAR(36)"))
-                    if 'accepted_at' not in l_cols:
-                        conn.execute(sa.text("ALTER TABLE leads ADD COLUMN accepted_at DATETIME" if is_sqlite else "ALTER TABLE leads ADD COLUMN accepted_at TIMESTAMP WITH TIME ZONE"))
+                if 'accepted_by' not in l_cols:
+                    conn.execute(sa.text("ALTER TABLE leads ADD COLUMN accepted_by VARCHAR(36)"))
+                if 'accepted_at' not in l_cols:
+                    conn.execute(sa.text("ALTER TABLE leads ADD COLUMN accepted_at DATETIME" if is_sqlite else "ALTER TABLE leads ADD COLUMN accepted_at TIMESTAMP WITH TIME ZONE"))
             if 'auth_sessions' in tables:
                 s_cols = {c['name'] for c in inspector.get_columns('auth_sessions')}
-                with conn.begin():
-                    if 'token_version' not in s_cols:
-                        conn.execute(sa.text("ALTER TABLE auth_sessions ADD COLUMN token_version INTEGER DEFAULT 1 NOT NULL"))
-                    if 'created_at' not in s_cols:
-                        conn.execute(sa.text("ALTER TABLE auth_sessions ADD COLUMN created_at DATETIME DEFAULT CURRENT_TIMESTAMP NOT NULL" if is_sqlite else "ALTER TABLE auth_sessions ADD COLUMN created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP NOT NULL"))
+                if 'token_version' not in s_cols:
+                    conn.execute(sa.text("ALTER TABLE auth_sessions ADD COLUMN token_version INTEGER DEFAULT 1 NOT NULL"))
+                if 'created_at' not in s_cols:
+                    conn.execute(sa.text("ALTER TABLE auth_sessions ADD COLUMN created_at DATETIME DEFAULT CURRENT_TIMESTAMP NOT NULL" if is_sqlite else "ALTER TABLE auth_sessions ADD COLUMN created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP NOT NULL"))
     except Exception as e:
         print(f"[Schema Reconciliation Notice]: {e}")
 
@@ -270,8 +272,9 @@ def health(db=Depends(get_db)):
 
 @app.post('/api/v1/auth/login')
 def login(payload: Login, request: Request, response: Response, db=Depends(get_db)):
-    # S8 – tighter login bucket: 5 attempts per 5 minutes per IP
-    limiter.check(('login', request.client.host), 5, 300)
+    # S8 – tighter login bucket: 5 attempts per 5 minutes per IP in prod (100 in dev)
+    login_limit = 5 if os.getenv('APP_ENV') == 'production' else 100
+    limiter.check(('login', request.client.host), login_limit, 300)
     origin = request.headers.get('origin')
     if request.headers.get('X-Timely-Request') != '1' or not is_trusted_origin(origin):
         raise HTTPException(403, 'Untrusted sign-in request')

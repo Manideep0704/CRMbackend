@@ -1,6 +1,9 @@
 import os
 from datetime import datetime, timezone
 from uuid import uuid4
+from dotenv import load_dotenv
+
+load_dotenv()
 
 from sqlalchemy import create_engine, event
 from sqlalchemy.orm import DeclarativeBase, sessionmaker

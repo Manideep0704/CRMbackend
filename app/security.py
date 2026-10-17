@@ -99,7 +99,7 @@ def is_trusted_origin(origin: str | None) -> bool:
         item = item.strip().rstrip('/')
         if item and item != '*':
             trusted.add(item)
-    # Always trust localhost origins in non-production only.
+    # Always trust localhost and private LAN origins in non-production only.
     if not is_production:
         trusted.update({
             'http://localhost:3000',
@@ -107,6 +107,8 @@ def is_trusted_origin(origin: str | None) -> bool:
             'http://localhost:8010',
             'http://127.0.0.1:8010',
         })
+        if clean_origin.startswith(('http://192.168.', 'http://10.', 'http://172.')):
+            return True
     return clean_origin in trusted
 
 
