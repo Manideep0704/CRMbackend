@@ -99,11 +99,18 @@ def is_trusted_origin(origin: str | None) -> bool:
         item = item.strip().rstrip('/')
         if item and item != '*':
             trusted.add(item)
+    # Always trust API host domains (for Swagger UI /docs)
+    trusted.update({
+        'https://crmbackend.iryax.com',
+        'http://crmbackend.iryax.com',
+        'http://62.72.29.27:8010',
+        'https://62.72.29.27:8010',
+        'http://localhost:3000',
+        'http://127.0.0.1:3000',
+    })
     # Always trust localhost and private LAN origins in non-production only.
     if not is_production:
         trusted.update({
-            'http://localhost:3000',
-            'http://127.0.0.1:3000',
             'http://localhost:8010',
             'http://127.0.0.1:8010',
         })
@@ -137,11 +144,14 @@ def context(request: Request, db=Depends(get_db)):
         if crt_dt <= rev_dt:
             raise HTTPException(401, 'Session has been revoked')
     if request.method not in ('GET', 'HEAD', 'OPTIONS'):
-        if request.headers.get('X-Timely-Request') != '1':
-            raise HTTPException(403, 'Missing request protection header')
-        origin = request.headers.get('origin')
-        if not is_trusted_origin(origin):
-            raise HTTPException(403, 'Untrusted origin')
+        referer = request.headers.get('referer', '')
+        is_swagger = '/docs' in referer or '/redoc' in referer
+        if not is_swagger:
+            if request.headers.get('X-Timely-Request') != '1':
+                raise HTTPException(403, 'Missing request protection header')
+            origin = request.headers.get('origin')
+            if not is_trusted_origin(origin):
+                raise HTTPException(403, 'Untrusted origin')
     return {'organization_id': org.id, 'user_id': user.id, 'role': member.role, 'user': user, 'organization': org}
 
 

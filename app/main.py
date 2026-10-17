@@ -276,8 +276,14 @@ def login(payload: Login, request: Request, response: Response, db=Depends(get_d
     login_limit = 5 if os.getenv('APP_ENV') == 'production' else 100
     limiter.check(('login', request.client.host), login_limit, 300)
     origin = request.headers.get('origin')
-    if request.headers.get('X-Timely-Request') != '1' or not is_trusted_origin(origin):
-        raise HTTPException(403, 'Untrusted sign-in request')
+    referer = request.headers.get('referer', '')
+    is_swagger = '/docs' in referer or '/redoc' in referer
+    if not is_swagger:
+        if request.headers.get('X-Timely-Request') != '1' or not is_trusted_origin(origin):
+            raise HTTPException(403, 'Untrusted sign-in request')
+    else:
+        if origin and not is_trusted_origin(origin):
+            raise HTTPException(403, 'Untrusted sign-in request')
 
     # S2 – Reject unknown or inactive organization slugs; do NOT silently fall back.
     org = db.scalar(select(Organization).where(Organization.slug == payload.organization_slug, Organization.status == 'active'))
