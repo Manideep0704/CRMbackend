@@ -40,8 +40,56 @@ app.add_middleware(
 
 @app.on_event("startup")
 def startup_db_init():
+    from pathlib import Path
+    try:
+        from alembic.config import Config
+        from alembic import command
+        ini_path = Path(__file__).resolve().parent.parent / 'alembic.ini'
+        if ini_path.exists():
+            cfg = Config(str(ini_path))
+            cfg.set_main_option('script_location', str(ini_path.parent / 'migrations'))
+            command.upgrade(cfg, 'head')
+    except Exception as e:
+        print(f"[Alembic Auto-Upgrade Notice]: {e}")
+
     from .db import Base, engine, SessionLocal
+    import sqlalchemy as sa
     Base.metadata.create_all(bind=engine)
+
+    # Defensive schema reconciliation: ensure required columns exist even on legacy unmigrated databases
+    try:
+        with engine.connect() as conn:
+            inspector = sa.inspect(conn)
+            tables = set(inspector.get_table_names())
+            is_sqlite = conn.dialect.name == 'sqlite'
+            if 'users' in tables:
+                u_cols = {c['name'] for c in inspector.get_columns('users')}
+                with conn.begin():
+                    if 'auth_provider' not in u_cols:
+                        conn.execute(sa.text("ALTER TABLE users ADD COLUMN auth_provider VARCHAR(40)"))
+                    if 'auth_subject' not in u_cols:
+                        conn.execute(sa.text("ALTER TABLE users ADD COLUMN auth_subject VARCHAR(160)"))
+                    if 'token_version' not in u_cols:
+                        conn.execute(sa.text("ALTER TABLE users ADD COLUMN token_version INTEGER DEFAULT 1 NOT NULL"))
+                    if 'sessions_revoked_at' not in u_cols:
+                        conn.execute(sa.text("ALTER TABLE users ADD COLUMN sessions_revoked_at DATETIME" if is_sqlite else "ALTER TABLE users ADD COLUMN sessions_revoked_at TIMESTAMP WITH TIME ZONE"))
+            if 'leads' in tables:
+                l_cols = {c['name'] for c in inspector.get_columns('leads')}
+                with conn.begin():
+                    if 'accepted_by' not in l_cols:
+                        conn.execute(sa.text("ALTER TABLE leads ADD COLUMN accepted_by VARCHAR(36)"))
+                    if 'accepted_at' not in l_cols:
+                        conn.execute(sa.text("ALTER TABLE leads ADD COLUMN accepted_at DATETIME" if is_sqlite else "ALTER TABLE leads ADD COLUMN accepted_at TIMESTAMP WITH TIME ZONE"))
+            if 'auth_sessions' in tables:
+                s_cols = {c['name'] for c in inspector.get_columns('auth_sessions')}
+                with conn.begin():
+                    if 'token_version' not in s_cols:
+                        conn.execute(sa.text("ALTER TABLE auth_sessions ADD COLUMN token_version INTEGER DEFAULT 1 NOT NULL"))
+                    if 'created_at' not in s_cols:
+                        conn.execute(sa.text("ALTER TABLE auth_sessions ADD COLUMN created_at DATETIME DEFAULT CURRENT_TIMESTAMP NOT NULL" if is_sqlite else "ALTER TABLE auth_sessions ADD COLUMN created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP NOT NULL"))
+    except Exception as e:
+        print(f"[Schema Reconciliation Notice]: {e}")
+
     with SessionLocal() as db:
         org = db.scalar(select(Organization).where(Organization.slug == "timely-health"))
         if not org:
@@ -197,6 +245,21 @@ async def security_headers(request: Request, call_next):
     response.headers['Cache-Control'] = 'no-store'
     response.headers['Referrer-Policy'] = 'same-origin'
     return response
+
+
+@app.get('/')
+def root():
+    return {
+        'service': 'Timely CRM Backend API',
+        'status': 'online',
+        'health': '/health',
+        'docs': '/docs',
+        'endpoints': {
+            'login': '/api/v1/auth/login',
+            'public_ingest': '/api/v1/public/leads',
+            'ingest_status': '/api/v1/public/ingest-status',
+        }
+    }
 
 
 @app.get('/health')

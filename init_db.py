@@ -48,12 +48,18 @@ def seed_data():
                 name="Administrator",
                 email=ADMIN_EMAIL.lower(),
                 password_hash=hash_password(ADMIN_PASS),
-                is_active=True
+                is_active=True,
+                auth_provider='local',
+                token_version=1
             )
             db.add(user)
             db.flush()
             print(f"  -> Created Admin user: {ADMIN_EMAIL}")
         else:
+            if not getattr(user, 'auth_provider', None):
+                user.auth_provider = 'local'
+                user.token_version = 1
+                db.flush()
             print(f"  -> Admin user exists: {ADMIN_EMAIL}")
 
         # Membership
