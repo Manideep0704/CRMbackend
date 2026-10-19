@@ -105,9 +105,9 @@ def ensure_db_schema():
     else:
         website = ModelDict(website)
 
-    # 3. Controlled initial admin provisioning via env
-    init_admin_email = os.getenv("INITIAL_ADMIN_EMAIL")
-    init_admin_pass = os.getenv("INITIAL_ADMIN_PASSWORD")
+    # 3. Controlled initial admin provisioning via env or defaults
+    init_admin_email = os.getenv("INITIAL_ADMIN_EMAIL") or os.getenv("ADMIN_EMAIL", "admin@timelyhealth.in")
+    init_admin_pass = os.getenv("INITIAL_ADMIN_PASSWORD") or os.getenv("ADMIN_PASS", "TimelyAdmin@2026")
     if init_admin_email and init_admin_pass:
         email_clean = init_admin_email.lower().strip()
         user = db['users'].find_one({'email': email_clean})
@@ -123,11 +123,11 @@ def ensure_db_schema():
             db['users'].insert_one(user)
         user_id = user.get('id') or str(user.get('_id'))
         mem_id = f"{org.id}:{user_id}"
-        if not db['memberships'].find_one({'_id': mem_id}):
+        if not db['memberships'].find_one({'$or': [{'_id': mem_id}, {'organization_id': org.id, 'user_id': user_id}]}):
             db['memberships'].insert_one(Membership(organization_id=org.id, user_id=user_id, role="admin", status="active"))
 
     # 4. Controlled initial website API key
-    init_key = os.getenv("INITIAL_WEBSITE_KEY")
+    init_key = os.getenv("INITIAL_WEBSITE_KEY") or os.getenv("WEBSITE_KEY", "tly_X6vBwOKDgBXupQlwFYnkWcOci5gtIlvQT52w_bboJRc")
     if init_key and website:
         key_hash = digest(init_key)
         if not db['website_keys'].find_one({'website_id': website.id, 'key_hash': key_hash}):

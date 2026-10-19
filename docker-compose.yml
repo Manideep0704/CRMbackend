@@ -1,0 +1,15 @@
+services:
+  crmbackend:
+    build: .
+    container_name: crmbackend
+    restart: unless-stopped
+    ports:
+      - "8010:8010"
+    environment:
+      - APP_ENV=production
+      - MONGO_URI=${MONGO_URI:-mongodb+srv://saquiba:saquiba123@cluster0.hrgeeif.mongodb.net/attendanceDB?retryWrites=true&w=majority&appName=attendance}
+      - FRONTEND_ORIGIN=${FRONTEND_ORIGIN:-http://localhost:3000,http://127.0.0.1:3000,https://crmbackend.iryax.com}
+      - ADMIN_EMAIL=${ADMIN_EMAIL:-admin@timelyhealth.in}
+      - ADMIN_PASS=${ADMIN_PASS:-TimelyAdmin@2026}
+      - DOMAIN=${DOMAIN:-digital.timelyhealth.in}
+      - WEBSITE_KEY=${WEBSITE_KEY:-tly_X6vBwOKDgBXupQlwFYnkWcOci5gtIlvQT52w_bboJRc}
