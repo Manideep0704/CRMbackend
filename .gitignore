@@ -25,5 +25,7 @@ wheels/
 
 
 timely.db
+*.db
+*.sqlite
 *.sqlite3
 .pytest_cache/
