@@ -43,8 +43,7 @@ app.add_middleware(
 )
 
 
-@app.on_event("startup")
-def startup_db_init():
+def ensure_db_schema():
     from pathlib import Path
     try:
         from alembic.config import Config
@@ -63,32 +62,30 @@ def startup_db_init():
 
     # Defensive schema reconciliation: ensure required columns exist even on legacy unmigrated databases
     try:
-        with engine.begin() as conn:
+        is_sqlite = engine.dialect.name == 'sqlite'
+        with engine.connect() as conn:
             inspector = sa.inspect(conn)
             tables = set(inspector.get_table_names())
-            is_sqlite = conn.dialect.name == 'sqlite'
-            if 'users' in tables:
-                u_cols = {c['name'] for c in inspector.get_columns('users')}
-                if 'auth_provider' not in u_cols:
-                    conn.execute(sa.text("ALTER TABLE users ADD COLUMN auth_provider VARCHAR(40)"))
-                if 'auth_subject' not in u_cols:
-                    conn.execute(sa.text("ALTER TABLE users ADD COLUMN auth_subject VARCHAR(160)"))
-                if 'token_version' not in u_cols:
-                    conn.execute(sa.text("ALTER TABLE users ADD COLUMN token_version INTEGER DEFAULT 1 NOT NULL"))
-                if 'sessions_revoked_at' not in u_cols:
-                    conn.execute(sa.text("ALTER TABLE users ADD COLUMN sessions_revoked_at DATETIME" if is_sqlite else "ALTER TABLE users ADD COLUMN sessions_revoked_at TIMESTAMP WITH TIME ZONE"))
-            if 'leads' in tables:
-                l_cols = {c['name'] for c in inspector.get_columns('leads')}
-                if 'accepted_by' not in l_cols:
-                    conn.execute(sa.text("ALTER TABLE leads ADD COLUMN accepted_by VARCHAR(36)"))
-                if 'accepted_at' not in l_cols:
-                    conn.execute(sa.text("ALTER TABLE leads ADD COLUMN accepted_at DATETIME" if is_sqlite else "ALTER TABLE leads ADD COLUMN accepted_at TIMESTAMP WITH TIME ZONE"))
-            if 'auth_sessions' in tables:
-                s_cols = {c['name'] for c in inspector.get_columns('auth_sessions')}
-                if 'token_version' not in s_cols:
-                    conn.execute(sa.text("ALTER TABLE auth_sessions ADD COLUMN token_version INTEGER DEFAULT 1 NOT NULL"))
-                if 'created_at' not in s_cols:
-                    conn.execute(sa.text("ALTER TABLE auth_sessions ADD COLUMN created_at DATETIME DEFAULT CURRENT_TIMESTAMP NOT NULL" if is_sqlite else "ALTER TABLE auth_sessions ADD COLUMN created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP NOT NULL"))
+            columns_to_ensure = [
+                ('users', 'auth_provider', "ALTER TABLE users ADD COLUMN auth_provider VARCHAR(40)"),
+                ('users', 'auth_subject', "ALTER TABLE users ADD COLUMN auth_subject VARCHAR(160)"),
+                ('users', 'token_version', "ALTER TABLE users ADD COLUMN token_version INTEGER DEFAULT 1 NOT NULL"),
+                ('users', 'sessions_revoked_at', "ALTER TABLE users ADD COLUMN sessions_revoked_at DATETIME" if is_sqlite else "ALTER TABLE users ADD COLUMN sessions_revoked_at TIMESTAMP WITH TIME ZONE"),
+                ('leads', 'accepted_by', "ALTER TABLE leads ADD COLUMN accepted_by VARCHAR(36)"),
+                ('leads', 'accepted_at', "ALTER TABLE leads ADD COLUMN accepted_at DATETIME" if is_sqlite else "ALTER TABLE leads ADD COLUMN accepted_at TIMESTAMP WITH TIME ZONE"),
+                ('auth_sessions', 'token_version', "ALTER TABLE auth_sessions ADD COLUMN token_version INTEGER DEFAULT 1 NOT NULL"),
+                ('auth_sessions', 'created_at', "ALTER TABLE auth_sessions ADD COLUMN created_at DATETIME DEFAULT CURRENT_TIMESTAMP NOT NULL" if is_sqlite else "ALTER TABLE auth_sessions ADD COLUMN created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP NOT NULL"),
+            ]
+            for tbl, col, sql in columns_to_ensure:
+                if tbl in tables:
+                    existing_cols = {c['name'] for c in inspector.get_columns(tbl)}
+                    if col not in existing_cols:
+                        try:
+                            with engine.begin() as alter_conn:
+                                alter_conn.execute(sa.text(sql))
+                            print(f"[Schema] Added column {tbl}.{col}")
+                        except Exception as ex:
+                            print(f"[Schema] Could not add {tbl}.{col}: {ex}")
     except Exception as e:
         print(f"[Schema Reconciliation Notice]: {e}")
 
@@ -142,6 +139,17 @@ def startup_db_init():
                     key_hash=key_hash
                 ))
         db.commit()
+
+
+try:
+    ensure_db_schema()
+except Exception as _schema_err:
+    print(f"[Pre-startup Schema Notice]: {_schema_err}")
+
+
+@app.on_event("startup")
+def startup_db_init():
+    ensure_db_schema()
     try:
         from .mongo import sync_sales_agents_from_mongo
         sync_sales_agents_from_mongo()
@@ -240,6 +248,14 @@ async def integrity_error(request, error):
     return JSONResponse(status_code=409, content={'detail': 'Record conflicts with an existing record or tenant relationship. Refresh and retry.'})
 
 
+@app.exception_handler(Exception)
+async def unhandled_exception(request: Request, error: Exception):
+    import traceback
+    trace = traceback.format_exc()
+    print(f"[UNHANDLED EXCEPTION] {request.method} {request.url.path}: {error}\n{trace}")
+    return JSONResponse(status_code=500, content={'detail': f"{type(error).__name__}: {str(error)}"})
+
+
 @app.middleware('http')
 async def security_headers(request: Request, call_next):
     response = await call_next(request)
@@ -288,148 +304,155 @@ def health(db=Depends(get_db)):
 
 @app.post('/api/v1/auth/login')
 def login(payload: Login, request: Request, response: Response, db=Depends(get_db)):
-    # S8 – tighter login bucket: 5 attempts per 5 minutes per IP in prod (100 in dev)
-    login_limit = 5 if os.getenv('APP_ENV') == 'production' else 100
-    limiter.check(('login', request.client.host), login_limit, 300)
-    origin = request.headers.get('origin')
-    referer = request.headers.get('referer', '')
-    is_swagger = '/docs' in referer or '/redoc' in referer
-    if not is_swagger:
-        if request.headers.get('X-Timely-Request') != '1' or not is_trusted_origin(origin):
-            raise HTTPException(403, 'Untrusted sign-in request')
-    else:
-        if origin and not is_trusted_origin(origin):
-            raise HTTPException(403, 'Untrusted sign-in request')
+    try:
+        # S8 – tighter login bucket: 5 attempts per 5 minutes per IP in prod (100 in dev)
+        login_limit = 5 if os.getenv('APP_ENV') == 'production' else 100
+        limiter.check(('login', request.client.host), login_limit, 300)
+        origin = request.headers.get('origin')
+        referer = request.headers.get('referer', '')
+        is_swagger = '/docs' in referer or '/redoc' in referer
+        if not is_swagger:
+            if request.headers.get('X-Timely-Request') != '1' or not is_trusted_origin(origin):
+                raise HTTPException(403, 'Untrusted sign-in request')
+        else:
+            if origin and not is_trusted_origin(origin):
+                raise HTTPException(403, 'Untrusted sign-in request')
 
-    # S2 – Reject unknown or inactive organization slugs; do NOT silently fall back.
-    org = db.scalar(select(Organization).where(Organization.slug == payload.organization_slug, Organization.status == 'active'))
-    if not org:
-        raise HTTPException(401, 'Invalid email, password or organization')
+        # S2 – Reject unknown or inactive organization slugs; do NOT silently fall back.
+        org = db.scalar(select(Organization).where(Organization.slug == payload.organization_slug, Organization.status == 'active'))
+        if not org:
+            raise HTTPException(401, 'Invalid email, password or organization')
 
-    user = db.scalar(select(User).where(User.email == payload.email.lower()))
+        user = db.scalar(select(User).where(User.email == payload.email.lower()))
 
-    # S3/R4 – Distinguish local vs federated accounts.
-    # Persist auth_provider: if account is federated ('attendance'), authentication MUST delegate to Mongo.
-    # Provider error/absence MUST fail closed (never fall back to local password).
-    from .mongo import authenticate_attendance_user, check_attendance_user_status
-    is_local_user = bool(user and getattr(user, 'auth_provider', None) == 'local')
-    is_federated = bool(
-        (user and getattr(user, 'auth_provider', None) == 'attendance')
-        or (user and getattr(user, 'auth_provider', None) is None and user.email.endswith('@timelyhealth.in') and user.email != 'admin@timelyhealth.in')
-    )
-    exists_in_dir, provider_ok = check_attendance_user_status(payload.email)
-    if not is_federated and exists_in_dir:
-        is_federated = True
-
-    mongo_user = None
-    if is_federated:
-        if not provider_ok:
-            # S3/R4 – Directory outage must NEVER fall back to local auth; fail closed.
-            raise HTTPException(503, 'External authentication provider is temporarily unavailable. Please try again later.')
-        mongo_user = authenticate_attendance_user(payload.email, payload.password)
-        valid = mongo_user is not None
-        # S3 – Wrong password does NOT globally disable user! Only invalidates this attempt.
-    else:
-        # Strictly local account: only verify against local scrypt hash if NOT federated
-        valid = verify_password(payload.password, user.password_hash if user else DUMMY_PASSWORD)
-
-    if mongo_user:
-        incoming_sub = str(mongo_user.get('_id', '')).strip()
-        incoming_email = mongo_user['email'].lower().strip()
-
-        # R5 – Subject-first identity resolution and collision enforcement
-        user_by_sub = db.scalar(
-            select(User).where(
-                User.auth_provider == 'attendance',
-                User.auth_subject == incoming_sub
-            )
-        ) if incoming_sub else None
-
-        user_by_email = db.scalar(
-            select(User).where(User.email == incoming_email)
+        # S3/R4 – Distinguish local vs federated accounts.
+        # Persist auth_provider: if account is federated ('attendance'), authentication MUST delegate to Mongo.
+        # Provider error/absence MUST fail closed (never fall back to local password).
+        from .mongo import authenticate_attendance_user, check_attendance_user_status
+        is_local_user = bool(user and getattr(user, 'auth_provider', None) == 'local')
+        is_federated = bool(
+            (user and getattr(user, 'auth_provider', None) == 'attendance')
+            or (user and getattr(user, 'auth_provider', None) is None and user.email.endswith('@timelyhealth.in') and user.email != 'admin@timelyhealth.in')
         )
+        exists_in_dir, provider_ok = check_attendance_user_status(payload.email)
+        if not is_federated and exists_in_dir:
+            is_federated = True
 
-        if user_by_sub and user_by_email and user_by_sub.id != user_by_email.id:
-            raise HTTPException(403, 'Identity collision: external subject and email belong to different accounts.')
-
-        if user_by_sub:
-            user = user_by_sub
-            if user.email != incoming_email:
-                user.email = incoming_email
-        elif user_by_email:
-            if user_by_email.auth_provider == 'local':
-                raise HTTPException(403, 'A local account already exists with this email. Federated linking requires administrator action.')
-            if user_by_email.auth_subject and user_by_email.auth_subject != incoming_sub:
-                raise HTTPException(403, 'External identity subject mismatch for this account.')
-            user = user_by_email
-            user.auth_provider = 'attendance'
-            user.auth_subject = incoming_sub
+        mongo_user = None
+        if is_federated:
+            if not provider_ok:
+                # S3/R4 – Directory outage must NEVER fall back to local auth; fail closed.
+                raise HTTPException(503, 'External authentication provider is temporarily unavailable. Please try again later.')
+            mongo_user = authenticate_attendance_user(payload.email, payload.password)
+            valid = mongo_user is not None
+            # S3 – Wrong password does NOT globally disable user! Only invalidates this attempt.
         else:
-            user = User(
-                name=mongo_user.get('name') or 'User',
-                email=incoming_email,
-                # S3 – Random unguessable hash for federated users; auth is always delegated to Mongo
-                password_hash=hash_password(secrets.token_urlsafe(32)),
-                is_active=True,
-                auth_provider='attendance',
-                auth_subject=incoming_sub,
-                token_version=1
+            # Strictly local account: only verify against local scrypt hash if NOT federated
+            valid = verify_password(payload.password, user.password_hash if user else DUMMY_PASSWORD)
+
+        if mongo_user:
+            incoming_sub = str(mongo_user.get('_id', '')).strip()
+            incoming_email = mongo_user['email'].lower().strip()
+
+            # R5 – Subject-first identity resolution and collision enforcement
+            user_by_sub = db.scalar(
+                select(User).where(
+                    User.auth_provider == 'attendance',
+                    User.auth_subject == incoming_sub
+                )
+            ) if incoming_sub else None
+
+            user_by_email = db.scalar(
+                select(User).where(User.email == incoming_email)
             )
-            db.add(user)
+
+            if user_by_sub and user_by_email and user_by_sub.id != user_by_email.id:
+                raise HTTPException(403, 'Identity collision: external subject and email belong to different accounts.')
+
+            if user_by_sub:
+                user = user_by_sub
+                if user.email != incoming_email:
+                    user.email = incoming_email
+            elif user_by_email:
+                if user_by_email.auth_provider == 'local':
+                    raise HTTPException(403, 'A local account already exists with this email. Federated linking requires administrator action.')
+                if user_by_email.auth_subject and user_by_email.auth_subject != incoming_sub:
+                    raise HTTPException(403, 'External identity subject mismatch for this account.')
+                user = user_by_email
+                user.auth_provider = 'attendance'
+                user.auth_subject = incoming_sub
+            else:
+                user = User(
+                    name=mongo_user.get('name') or 'User',
+                    email=incoming_email,
+                    # S3 – Random unguessable hash for federated users; auth is always delegated to Mongo
+                    password_hash=hash_password(secrets.token_urlsafe(32)),
+                    is_active=True,
+                    auth_provider='attendance',
+                    auth_subject=incoming_sub,
+                    token_version=1
+                )
+                db.add(user)
+                db.flush()
+
+            # R6 – Local suspension policy: CRM administrator suspension strictly overrides external provider status
+            if not user.is_active:
+                raise HTTPException(403, 'Account is inactive or suspended in CRM.')
+
+            # S3 – Overwrite any legacy password hash with random unguessable secret
+            user.password_hash = hash_password(secrets.token_urlsafe(32))
+            if mongo_user.get('name') and not user.name:
+                user.name = mongo_user['name']
             db.flush()
 
-        # R6 – Local suspension policy: CRM administrator suspension strictly overrides external provider status
-        if not user.is_active:
-            raise HTTPException(403, 'Account is inactive or suspended in CRM.')
+            # S2 – Check organization entitlement!
+            # An attendance identity is ONLY entitled to their designated organization (e.g. 'timely-health').
+            # Cross-tenant auto-provisioning into arbitrary requested organizations is strictly forbidden.
+            entitled_slug = mongo_user.get('entitled_org_slug', 'timely-health')
+            membership_check = db.get(Membership, (org.id, user.id))
+            if not membership_check:
+                # Deny provisioning in unentitled organizations
+                if org.slug != entitled_slug:
+                    raise HTTPException(401, 'Invalid email, password or organization')
 
-        # S3 – Overwrite any legacy password hash with random unguessable secret
-        user.password_hash = hash_password(secrets.token_urlsafe(32))
-        if mongo_user.get('name') and not user.name:
-            user.name = mongo_user['name']
-        db.flush()
-
-        # S2 – Check organization entitlement!
-        # An attendance identity is ONLY entitled to their designated organization (e.g. 'timely-health').
-        # Cross-tenant auto-provisioning into arbitrary requested organizations is strictly forbidden.
-        entitled_slug = mongo_user.get('entitled_org_slug', 'timely-health')
-        membership_check = db.get(Membership, (org.id, user.id))
-        if not membership_check:
-            # Deny provisioning in unentitled organizations
-            if org.slug != entitled_slug:
-                raise HTTPException(401, 'Invalid email, password or organization')
-
-            allowed_roles = {'admin', 'agent', 'viewer'}
-            raw_role = mongo_user.get('role', 'viewer')
-            safe_role = raw_role if raw_role in allowed_roles else 'viewer'
-            membership_check = Membership(
-                organization_id=org.id,
-                user_id=user.id,
-                role=safe_role,
-                status='active'
-            )
-            db.add(membership_check)
-            db.flush()
-        else:
-            if membership_check.status != 'active':
-                raise HTTPException(403, 'Organization access is inactive')
-            if org.slug == entitled_slug and mongo_user.get('role'):
                 allowed_roles = {'admin', 'agent', 'viewer'}
-                raw_role = mongo_user.get('role', membership_check.role)
-                if raw_role in allowed_roles:
-                    membership_check.role = raw_role
-                    db.flush()
-        valid = True
+                raw_role = mongo_user.get('role', 'viewer')
+                safe_role = raw_role if raw_role in allowed_roles else 'viewer'
+                membership_check = Membership(
+                    organization_id=org.id,
+                    user_id=user.id,
+                    role=safe_role,
+                    status='active'
+                )
+                db.add(membership_check)
+                db.flush()
+            else:
+                if membership_check.status != 'active':
+                    raise HTTPException(403, 'Organization access is inactive')
+                if org.slug == entitled_slug and mongo_user.get('role'):
+                    allowed_roles = {'admin', 'agent', 'viewer'}
+                    raw_role = mongo_user.get('role', membership_check.role)
+                    if raw_role in allowed_roles:
+                        membership_check.role = raw_role
+                        db.flush()
+            valid = True
 
-    membership = db.get(Membership, (org.id, user.id)) if org and user else None
-    if not valid or not user or not user.is_active or not membership or membership.status != 'active':
-        raise HTTPException(401, 'Invalid email, password or organization')
-    token = new_session(db, user, org.id)
-    db.commit()
-    # S5 – Secure flag: always True in production regardless of origin.
-    is_production = os.getenv('APP_ENV') == 'production'
-    is_secure = is_production
-    response.set_cookie('timely_session', token, httponly=True, secure=is_secure, samesite='lax', max_age=43200, path='/')
-    return {'user': serialize(user), 'organization': serialize(org), 'role': membership.role}
+        membership = db.get(Membership, (org.id, user.id)) if org and user else None
+        if not valid or not user or not user.is_active or not membership or membership.status != 'active':
+            raise HTTPException(401, 'Invalid email, password or organization')
+        token = new_session(db, user, org.id)
+        db.commit()
+        # S5 – Secure flag: always True in production regardless of origin.
+        is_production = os.getenv('APP_ENV') == 'production'
+        is_secure = is_production
+        response.set_cookie('timely_session', token, httponly=True, secure=is_secure, samesite='lax', max_age=43200, path='/')
+        return {'user': serialize(user), 'organization': serialize(org), 'role': membership.role}
+    except HTTPException:
+        raise
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Login Error ({type(e).__name__}): {str(e)}")
 
 
 @app.post('/api/v1/auth/logout')
