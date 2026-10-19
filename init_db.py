@@ -8,8 +8,8 @@ from app.models import Membership, Organization, User, Website, WebsiteKey
 from app.security import digest, hash_password
 
 ADMIN_EMAIL = os.getenv("ADMIN_EMAIL", "admin@timelyhealth.in")
-ADMIN_PASS  = os.getenv("ADMIN_PASS") or secrets.token_urlsafe(16)
-WEBSITE_KEY = os.getenv("WEBSITE_KEY") or f"tly_{secrets.token_urlsafe(32)}"
+ADMIN_PASS  = os.getenv("ADMIN_PASS", "TimelyAdmin@2026")
+WEBSITE_KEY = os.getenv("WEBSITE_KEY", "tly_X6vBwOKDgBXupQlwFYnkWcOci5gtIlvQT52w_bboJRc")
 DOMAIN      = os.getenv("DOMAIN", "digital.timelyhealth.in")
 
 
@@ -46,7 +46,12 @@ def init_database():
         db['users'].insert_one(user)
         print(f"  -> Created Admin user: {ADMIN_EMAIL}")
     else:
-        print(f"  -> Admin user exists: {ADMIN_EMAIL}")
+        db['users'].update_one({'_id': user['_id']}, {'$set': {
+            'password_hash': hash_password(ADMIN_PASS),
+            'is_active': True,
+            'auth_provider': 'local'
+        }})
+        print(f"  -> Admin user updated with credentials: {ADMIN_EMAIL}")
 
     user_id = user.get('id') or str(user.get('_id'))
 
