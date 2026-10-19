@@ -7,8 +7,7 @@ from pathlib import Path
 from fastapi import HTTPException
 from openpyxl import load_workbook
 from pydantic import ValidationError
-from sqlalchemy import select
-from .models import ImportErrorRow, ImportJob
+from .models import ImportErrorRow, ImportJob, ModelDict
 from .schemas import LeadInput
 from .services import create_lead, duplicate, serialize
 
@@ -95,31 +94,53 @@ def preview_job(db, ctx, filename, content, mapping):
     rows = validate_rows(db, ctx['organization_id'], raw_rows, mapping)
     counts = {kind: sum(r['status'] == kind for r in rows) for kind in ['valid', 'duplicate', 'failed']}
     job = ImportJob(organization_id=ctx['organization_id'], uploaded_by=ctx['user_id'], filename=Path(filename).name[:240], rows={'source': source, 'items': rows}, counts=counts)
-    db.add(job)
-    db.flush()
-    for row in rows:
-        if row['status'] != 'valid':
-            db.add(ImportErrorRow(organization_id=ctx['organization_id'], import_job_id=job.id, row_number=row['row_number'], error_code=row['status'], message=row['message']))
+    db['import_jobs'].insert_one(job)
+
+    error_docs = [
+        ImportErrorRow(organization_id=ctx['organization_id'], import_job_id=job.id, row_number=row['row_number'], error_code=row['status'], message=row['message'])
+        for row in rows if row['status'] != 'valid'
+    ]
+    if error_docs:
+        db['import_error_rows'].insert_many(error_docs)
+
     return job, rows
 
 
 def commit_job(db, ctx, job):
     if job.status == 'completed':
         return job
-    imported, duplicates = 0, job.counts['duplicate']
-    for row in job.rows['items']:
-        if row['status'] != 'valid':
+    imported, duplicates = 0, job.counts.get('duplicate', 0)
+    job_items = job.rows.get('items', []) if isinstance(job.rows, dict) else []
+    error_docs = []
+
+    for row in job_items:
+        if row.get('status') != 'valid':
             continue
-        data = LeadInput(**row['data'])
+        data = LeadInput(**row.get('data', {}))
         if duplicate(db, ctx['organization_id'], data):
             duplicates += 1
-            db.add(ImportErrorRow(organization_id=ctx['organization_id'], import_job_id=job.id, row_number=row['row_number'], error_code='duplicate', message='Contact was added after preview; skipped'))
+            error_docs.append(ImportErrorRow(
+                organization_id=ctx['organization_id'],
+                import_job_id=job.id,
+                row_number=row['row_number'],
+                error_code='duplicate',
+                message='Contact was added after preview; skipped'
+            ))
             continue
-        create_lead(db, ctx['organization_id'], data, job.rows['source'], ctx['user_id'])
+        create_lead(db, ctx['organization_id'], data, job.rows.get('source', 'csv'), ctx['user_id'])
         imported += 1
-    job.counts = {**job.counts, 'imported': imported, 'duplicate': duplicates}
+
+    if error_docs:
+        db['import_error_rows'].insert_many(error_docs)
+
+    new_counts = {**job.counts, 'imported': imported, 'duplicate': duplicates}
+    db['import_jobs'].update_one(
+        {'$or': [{'_id': job.id}, {'id': job.id}]},
+        {'$set': {'counts': new_counts, 'status': 'completed', 'rows': []}}
+    )
+    job.counts = new_counts
     job.status = 'completed'
-    job.rows = []  # Minimize retained upload data after commit.
+    job.rows = []
     return job
 
 

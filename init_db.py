@@ -1,107 +1,97 @@
-"""One-step server database initializer for Timely CRM backend.
-Runs migrations and creates the initial organization, admin user, and website API key.
+"""One-step server database initializer for Timely CRM backend with MongoDB Atlas.
+Ensures MongoDB indexes and creates the initial organization, admin user, and website API key.
 """
-import sys
-import subprocess
-from sqlalchemy import select
-from app.db import SessionLocal
-from app.models import Organization, User, Membership, Website, WebsiteKey
-from app.security import hash_password, digest
-
 import os
 import secrets
+from app.db import get_crm_db, init_mongo_indexes
+from app.models import Membership, Organization, User, Website, WebsiteKey
+from app.security import digest, hash_password
 
 ADMIN_EMAIL = os.getenv("ADMIN_EMAIL", "admin@timelyhealth.in")
 ADMIN_PASS  = os.getenv("ADMIN_PASS") or secrets.token_urlsafe(16)
 WEBSITE_KEY = os.getenv("WEBSITE_KEY") or f"tly_{secrets.token_urlsafe(32)}"
 DOMAIN      = os.getenv("DOMAIN", "digital.timelyhealth.in")
 
-def run_migrations():
-    print("[1/3] Running database migrations (alembic upgrade head)...")
-    res = subprocess.run(["alembic", "upgrade", "head"], capture_output=True, text=True)
-    if res.returncode != 0:
-        print("Alembic error:", res.stderr)
-        # fallback to sys.executable -m alembic
-        res2 = subprocess.run([sys.executable, "-m", "alembic", "upgrade", "head"], capture_output=True, text=True)
-        if res2.returncode != 0:
-            print("Failed to run migrations:", res2.stderr)
-            sys.exit(1)
-    print("  -> Database tables created successfully.")
 
-def seed_data():
-    print("[2/3] Setting up Organization, Admin User, and Website...")
-    with SessionLocal() as db:
-        # Organization
-        org = db.scalar(select(Organization).where(Organization.slug == "timely-health"))
-        if not org:
-            org = Organization(name="Timely Health", slug="timely-health", status="active")
-            db.add(org)
-            db.flush()
-            print(f"  -> Created Organization: {org.name} ({org.slug})")
-        else:
-            print(f"  -> Organization exists: {org.name}")
+def init_database():
+    print("[1/3] Ensuring MongoDB indexes...")
+    init_mongo_indexes()
+    db = get_crm_db()
 
-        # Admin user
-        user = db.scalar(select(User).where(User.email == ADMIN_EMAIL.lower()))
-        if not user:
-            user = User(
-                name="Administrator",
-                email=ADMIN_EMAIL.lower(),
-                password_hash=hash_password(ADMIN_PASS),
-                is_active=True,
-                auth_provider='local',
-                token_version=1
-            )
-            db.add(user)
-            db.flush()
-            print(f"  -> Created Admin user: {ADMIN_EMAIL}")
-        else:
-            if not getattr(user, 'auth_provider', None):
-                user.auth_provider = 'local'
-                user.token_version = 1
-                db.flush()
-            print(f"  -> Admin user exists: {ADMIN_EMAIL}")
+    print("[2/3] Setting up Organization, Admin User, and Website in MongoDB crmDB...")
 
-        # Membership
-        mem = db.get(Membership, (org.id, user.id))
-        if not mem:
-            db.add(Membership(organization_id=org.id, user_id=user.id, role="admin", status="active"))
-            db.flush()
+    # 1. Organization
+    org = db['organizations'].find_one({'slug': "timely-health"})
+    if not org:
+        org = Organization(name="Timely Health", slug="timely-health", status="active")
+        db['organizations'].insert_one(org)
+        print(f"  -> Created Organization: {org['name']} ({org['slug']})")
+    else:
+        print(f"  -> Organization exists: {org['name']}")
 
-        # Website
-        website = db.scalar(select(Website).where(Website.organization_id == org.id, Website.domain == DOMAIN))
-        if not website:
-            website = Website(
-                organization_id=org.id,
-                name="Timely Health Digital",
-                domain=DOMAIN,
-                status="active",
-                config={}
-            )
-            db.add(website)
-            db.flush()
-            print(f"  -> Registered Website: {DOMAIN}")
-        else:
-            print(f"  -> Website exists: {DOMAIN}")
+    org_id = org.get('id') or str(org.get('_id'))
 
-        # Website Key
-        key_hash = digest(WEBSITE_KEY)
-        key = db.scalar(select(WebsiteKey).where(WebsiteKey.website_id == website.id, WebsiteKey.key_hash == key_hash))
-        if not key:
-            db.add(WebsiteKey(
-                organization_id=org.id,
-                website_id=website.id,
-                key_hash=key_hash
-            ))
-            db.flush()
-            print("  -> Website API Key registered.")
-        else:
-            print("  -> Website API Key is already active.")
+    # 2. Admin User
+    email_clean = ADMIN_EMAIL.lower().strip()
+    user = db['users'].find_one({'email': email_clean})
+    if not user:
+        user = User(
+            name="Administrator",
+            email=email_clean,
+            password_hash=hash_password(ADMIN_PASS),
+            is_active=True,
+            auth_provider='local',
+            token_version=1
+        )
+        db['users'].insert_one(user)
+        print(f"  -> Created Admin user: {ADMIN_EMAIL}")
+    else:
+        print(f"  -> Admin user exists: {ADMIN_EMAIL}")
 
-        db.commit()
+    user_id = user.get('id') or str(user.get('_id'))
 
-    print("[3/3] Database initialization complete!")
+    # 3. Membership
+    mem_id = f"{org_id}:{user_id}"
+    mem = db['memberships'].find_one({'$or': [{'_id': mem_id}, {'organization_id': org_id, 'user_id': user_id}]})
+    if not mem:
+        db['memberships'].insert_one(Membership(organization_id=org_id, user_id=user_id, role="admin", status="active"))
+        print("  -> Assigned Admin membership role.")
+    else:
+        print("  -> Admin membership is active.")
+
+    # 4. Website
+    website = db['websites'].find_one({'organization_id': org_id, 'domain': DOMAIN})
+    if not website:
+        website = Website(
+            organization_id=org_id,
+            name="Timely Health Digital",
+            domain=DOMAIN,
+            status="active",
+            config={}
+        )
+        db['websites'].insert_one(website)
+        print(f"  -> Registered Website: {DOMAIN}")
+    else:
+        print(f"  -> Website exists: {DOMAIN}")
+
+    website_id = website.get('id') or str(website.get('_id'))
+
+    # 5. Website Key
+    key_hash = digest(WEBSITE_KEY)
+    key = db['website_keys'].find_one({'website_id': website_id, 'key_hash': key_hash})
+    if not key:
+        db['website_keys'].insert_one(WebsiteKey(
+            organization_id=org_id,
+            website_id=website_id,
+            key_hash=key_hash
+        ))
+        print("  -> Website API Key registered.")
+    else:
+        print("  -> Website API Key is already active.")
+
+    print("[3/3] MongoDB Database initialization complete!")
     print("\n-----------------------------------------------------------")
+    print("Database       : MongoDB Atlas (crmDB)")
     print("Admin Email    : " + ADMIN_EMAIL)
     print("Admin Password : " + ADMIN_PASS)
     print("Org Slug       : timely-health")
@@ -109,6 +99,6 @@ def seed_data():
     print("Ingest URL     : https://crmbackend.iryax.com/api/v1/public/leads")
     print("-----------------------------------------------------------\n")
 
-if __name__ == "__main__":
-    run_migrations()
-    seed_data()
+
+if __name__ == '__main__':
+    init_database()

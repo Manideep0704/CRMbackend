@@ -1,170 +1,259 @@
-from sqlalchemy import Boolean, CheckConstraint, DateTime, ForeignKey, ForeignKeyConstraint, Index, Integer, JSON, String, Text, UniqueConstraint
-from sqlalchemy.orm import Mapped, mapped_column
-from .db import Base, now, uid
+from .db import now, uid
 
 
-class Organization(Base):
-    __tablename__ = 'organizations'
-    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uid)
-    name: Mapped[str] = mapped_column(String(160))
-    slug: Mapped[str] = mapped_column(String(100), unique=True)
-    status: Mapped[str] = mapped_column(String(20), default='active')
-    created_at: Mapped[object] = mapped_column(DateTime(timezone=True), default=now)
+class ModelDict(dict):
+    """
+    Dictionary wrapper that allows dot notation attribute access
+    while maintaining 100% dictionary compatibility with PyMongo and FastAPI.
+    """
+    def __getattr__(self, name):
+        try:
+            return self[name]
+        except KeyError:
+            return None
+
+    def __setattr__(self, name, value):
+        self[name] = value
+
+    def __delattr__(self, name):
+        try:
+            del self[name]
+        except KeyError:
+            pass
 
 
-class User(Base):
-    __tablename__ = 'users'
-    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uid)
-    name: Mapped[str] = mapped_column(String(160))
-    email: Mapped[str] = mapped_column(String(254), unique=True)
-    password_hash: Mapped[str] = mapped_column(Text)
-    is_active: Mapped[bool] = mapped_column(Boolean, default=True)
-    # S3/S4 – Federated identity: persisted so provider absence never falls back to local auth.
-    # auth_provider: 'local' | 'attendance'  (NULL treated as 'local' for legacy rows)
-    auth_provider: Mapped[str | None] = mapped_column(String(40), nullable=True, default=None)
-    # auth_subject: stable external subject ID (e.g. MongoDB _id hex string)
-    auth_subject: Mapped[str | None] = mapped_column(String(160), nullable=True, default=None, index=True)
-    # S5 – Session revocation & token versioning
-    token_version: Mapped[int] = mapped_column(Integer, default=1)
-    sessions_revoked_at: Mapped[object | None] = mapped_column(DateTime(timezone=True), nullable=True, default=None)
+def Organization(name: str, slug: str, status: str = 'active', id: str = None) -> ModelDict:
+    item_id = id or uid()
+    return ModelDict({
+        '_id': item_id,
+        'id': item_id,
+        'name': name,
+        'slug': slug,
+        'status': status,
+        'created_at': now()
+    })
 
 
-class Membership(Base):
-    __tablename__ = 'organization_memberships'
-    organization_id: Mapped[str] = mapped_column(ForeignKey('organizations.id'), primary_key=True)
-    user_id: Mapped[str] = mapped_column(ForeignKey('users.id'), primary_key=True)
-    role: Mapped[str] = mapped_column(String(20), default='agent')
-    status: Mapped[str] = mapped_column(String(20), default='active')
-    __table_args__ = (CheckConstraint("role IN ('admin','agent','viewer')"),)
+def User(
+    email: str,
+    name: str = '',
+    password_hash: str = '',
+    is_active: bool = True,
+    auth_provider: str = 'local',
+    auth_subject: str = None,
+    token_version: int = 1,
+    id: str = None
+) -> ModelDict:
+    item_id = id or uid()
+    return ModelDict({
+        '_id': item_id,
+        'id': item_id,
+        'name': name,
+        'email': email.lower().strip(),
+        'password_hash': password_hash,
+        'is_active': is_active,
+        'auth_provider': auth_provider,
+        'auth_subject': auth_subject,
+        'token_version': token_version,
+        'sessions_revoked_at': None
+    })
 
 
-class AuthSession(Base):
-    __tablename__ = 'auth_sessions'
-    token_hash: Mapped[str] = mapped_column(String(64), primary_key=True)
-    user_id: Mapped[str] = mapped_column(ForeignKey('users.id'))
-    organization_id: Mapped[str] = mapped_column(ForeignKey('organizations.id'))
-    expires_at: Mapped[object] = mapped_column(DateTime(timezone=True))
-    created_at: Mapped[object] = mapped_column(DateTime(timezone=True), default=now)
-    token_version: Mapped[int] = mapped_column(Integer, default=1)
-    __table_args__ = (ForeignKeyConstraint(['organization_id', 'user_id'], ['organization_memberships.organization_id', 'organization_memberships.user_id']),)
+def Membership(organization_id: str, user_id: str, role: str = 'agent', status: str = 'active') -> ModelDict:
+    mem_id = f"{organization_id}:{user_id}"
+    return ModelDict({
+        '_id': mem_id,
+        'id': mem_id,
+        'organization_id': organization_id,
+        'user_id': user_id,
+        'role': role,
+        'status': status
+    })
 
 
-class Website(Base):
-    __tablename__ = 'websites'
-    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uid)
-    organization_id: Mapped[str] = mapped_column(ForeignKey('organizations.id'), index=True)
-    name: Mapped[str] = mapped_column(String(160))
-    domain: Mapped[str] = mapped_column(String(253))
-    status: Mapped[str] = mapped_column(String(20), default='active')
-    config: Mapped[dict] = mapped_column(JSON, default=dict)
-    created_at: Mapped[object] = mapped_column(DateTime(timezone=True), default=now)
-    __table_args__ = (UniqueConstraint('organization_id', 'id'), UniqueConstraint('organization_id', 'domain'))
+def Website(
+    organization_id: str,
+    name: str,
+    domain: str,
+    status: str = 'active',
+    config: dict = None,
+    id: str = None
+) -> ModelDict:
+    item_id = id or uid()
+    return ModelDict({
+        '_id': item_id,
+        'id': item_id,
+        'organization_id': organization_id,
+        'name': name,
+        'domain': domain.lower().strip(),
+        'status': status,
+        'config': config or {},
+        'created_at': now()
+    })
 
 
-class WebsiteKey(Base):
-    __tablename__ = 'website_api_keys'
-    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uid)
-    organization_id: Mapped[str] = mapped_column(ForeignKey('organizations.id'), index=True)
-    website_id: Mapped[str] = mapped_column(String(36))
-    key_hash: Mapped[str] = mapped_column(String(64), unique=True)
-    created_at: Mapped[object] = mapped_column(DateTime(timezone=True), default=now)
-    revoked_at: Mapped[object | None] = mapped_column(DateTime(timezone=True), nullable=True)
-    __table_args__ = (ForeignKeyConstraint(['organization_id', 'website_id'], ['websites.organization_id', 'websites.id']),)
+def WebsiteKey(organization_id: str, website_id: str, key_hash: str, id: str = None) -> ModelDict:
+    item_id = id or uid()
+    return ModelDict({
+        '_id': item_id,
+        'id': item_id,
+        'organization_id': organization_id,
+        'website_id': website_id,
+        'key_hash': key_hash,
+        'created_at': now()
+    })
 
 
-class Lead(Base):
-    __tablename__ = 'leads'
-    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uid)
-    organization_id: Mapped[str] = mapped_column(ForeignKey('organizations.id'), index=True)
-    website_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
-    assigned_to: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
-    accepted_by: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
-    accepted_at: Mapped[object | None] = mapped_column(DateTime(timezone=True), nullable=True)
-    full_name: Mapped[str] = mapped_column(String(160))
-    phone: Mapped[str] = mapped_column(String(32), default='', index=True)
-    email: Mapped[str] = mapped_column(String(254), default='', index=True)
-    company_name: Mapped[str] = mapped_column(String(160), default='')
-    inquiry_type: Mapped[str] = mapped_column(String(160), default='')
-    source: Mapped[str] = mapped_column(String(20))
-    status: Mapped[str] = mapped_column(String(20), default='new', index=True)
-    priority: Mapped[str] = mapped_column(String(20), default='medium')
-    tags: Mapped[list] = mapped_column(JSON, default=list)
-    attribution: Mapped[dict] = mapped_column(JSON, default=dict)
-    duplicate_of: Mapped[str | None] = mapped_column(String(36), nullable=True)
-    external_submission_id: Mapped[str | None] = mapped_column(String(160), nullable=True)
-    next_follow_up_at: Mapped[object | None] = mapped_column(DateTime(timezone=True), nullable=True)
-    created_at: Mapped[object] = mapped_column(DateTime(timezone=True), default=now, index=True)
-    updated_at: Mapped[object] = mapped_column(DateTime(timezone=True), default=now, onupdate=now)
-    deleted_at: Mapped[object | None] = mapped_column(DateTime(timezone=True), nullable=True)
-    __table_args__ = (
-        UniqueConstraint('organization_id', 'id'),
-        UniqueConstraint('website_id', 'external_submission_id'),
-        ForeignKeyConstraint(['organization_id', 'website_id'], ['websites.organization_id', 'websites.id']),
-        ForeignKeyConstraint(['organization_id', 'assigned_to'], ['organization_memberships.organization_id', 'organization_memberships.user_id']),
-        ForeignKeyConstraint(['organization_id', 'duplicate_of'], ['leads.organization_id', 'leads.id']),
-        CheckConstraint("status IN ('new','contacted','qualified','converted','lost')"),
-        CheckConstraint("priority IN ('low','medium','high')"),
-        Index('ix_leads_tenant_created', 'organization_id', 'created_at'),
-    )
+def Lead(
+    organization_id: str,
+    full_name: str,
+    phone: str = '',
+    email: str = '',
+    company_name: str = '',
+    inquiry_type: str = '',
+    status: str = 'new',
+    priority: str = 'medium',
+    website_id: str = None,
+    assigned_to: str = None,
+    accepted_by: str = None,
+    accepted_at = None,
+    source: str = 'manual',
+    duplicate_of: str = None,
+    external_submission_id: str = None,
+    attribution: dict = None,
+    tags: list = None,
+    next_follow_up_at = None,
+    id: str = None,
+    **extra
+) -> ModelDict:
+    item_id = id or uid()
+    lead_dict = {
+        '_id': item_id,
+        'id': item_id,
+        'organization_id': organization_id,
+        'website_id': website_id,
+        'full_name': full_name,
+        'phone': phone,
+        'email': email.lower().strip() if email else '',
+        'company_name': company_name,
+        'inquiry_type': inquiry_type,
+        'status': status,
+        'priority': priority,
+        'assigned_to': assigned_to,
+        'accepted_by': accepted_by,
+        'accepted_at': accepted_at,
+        'source': source,
+        'duplicate_of': duplicate_of,
+        'external_submission_id': external_submission_id,
+        'attribution': attribution or {},
+        'tags': tags or [],
+        'next_follow_up_at': next_follow_up_at,
+        'deleted_at': None,
+        'created_at': now(),
+        'updated_at': now()
+    }
+    lead_dict.update(extra)
+    return ModelDict(lead_dict)
 
 
-class Activity(Base):
-    __tablename__ = 'lead_activities'
-    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uid)
-    organization_id: Mapped[str] = mapped_column(ForeignKey('organizations.id'), index=True)
-    lead_id: Mapped[str] = mapped_column(String(36), index=True)
-    user_id: Mapped[str | None] = mapped_column(ForeignKey('users.id'), nullable=True)
-    type: Mapped[str] = mapped_column(String(40))
-    description: Mapped[str] = mapped_column(Text)
-    created_at: Mapped[object] = mapped_column(DateTime(timezone=True), default=now)
-    __table_args__ = (ForeignKeyConstraint(['organization_id', 'lead_id'], ['leads.organization_id', 'leads.id']),)
+def Activity(organization_id: str, lead_id: str, user_id: str, type: str, description: str, id: str = None) -> ModelDict:
+    item_id = id or uid()
+    return ModelDict({
+        '_id': item_id,
+        'id': item_id,
+        'organization_id': organization_id,
+        'lead_id': lead_id,
+        'user_id': user_id,
+        'type': type,
+        'description': description,
+        'created_at': now()
+    })
 
 
-class FollowUp(Base):
-    __tablename__ = 'follow_up_tasks'
-    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uid)
-    organization_id: Mapped[str] = mapped_column(ForeignKey('organizations.id'), index=True)
-    lead_id: Mapped[str] = mapped_column(String(36))
-    assigned_to: Mapped[str | None] = mapped_column(String(36), nullable=True)
-    title: Mapped[str] = mapped_column(String(240))
-    due_at: Mapped[object] = mapped_column(DateTime(timezone=True), index=True)
-    status: Mapped[str] = mapped_column(String(20), default='open')
-    created_at: Mapped[object] = mapped_column(DateTime(timezone=True), default=now)
-    __table_args__ = (
-        ForeignKeyConstraint(['organization_id', 'lead_id'], ['leads.organization_id', 'leads.id']),
-        ForeignKeyConstraint(['organization_id', 'assigned_to'], ['organization_memberships.organization_id', 'organization_memberships.user_id']),
-    )
+def Note(organization_id: str, lead_id: str, user_id: str, description: str, id: str = None) -> ModelDict:
+    item_id = id or uid()
+    return ModelDict({
+        '_id': item_id,
+        'id': item_id,
+        'organization_id': organization_id,
+        'lead_id': lead_id,
+        'user_id': user_id,
+        'description': description,
+        'created_at': now()
+    })
 
 
-class ImportJob(Base):
-    __tablename__ = 'import_jobs'
-    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uid)
-    organization_id: Mapped[str] = mapped_column(ForeignKey('organizations.id'), index=True)
-    uploaded_by: Mapped[str] = mapped_column(ForeignKey('users.id'))
-    filename: Mapped[str] = mapped_column(String(240))
-    status: Mapped[str] = mapped_column(String(20), default='preview')
-    rows: Mapped[list] = mapped_column(JSON, default=list)
-    counts: Mapped[dict] = mapped_column(JSON, default=dict)
-    created_at: Mapped[object] = mapped_column(DateTime(timezone=True), default=now)
-    __table_args__ = (UniqueConstraint('organization_id', 'id'),)
+def FollowUp(
+    organization_id: str,
+    lead_id: str,
+    due_at,
+    title: str = 'Scheduled follow-up',
+    assigned_to: str = None,
+    status: str = 'open',
+    id: str = None
+) -> ModelDict:
+    item_id = id or uid()
+    return ModelDict({
+        '_id': item_id,
+        'id': item_id,
+        'organization_id': organization_id,
+        'lead_id': lead_id,
+        'assigned_to': assigned_to,
+        'due_at': due_at,
+        'status': status,
+        'title': title,
+        'created_at': now()
+    })
 
 
-class ImportErrorRow(Base):
-    __tablename__ = 'import_row_errors'
-    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uid)
-    organization_id: Mapped[str] = mapped_column(ForeignKey('organizations.id'), index=True)
-    import_job_id: Mapped[str] = mapped_column(String(36))
-    row_number: Mapped[int] = mapped_column(Integer)
-    error_code: Mapped[str] = mapped_column(String(40))
-    message: Mapped[str] = mapped_column(String(500))
-    __table_args__ = (ForeignKeyConstraint(['organization_id', 'import_job_id'], ['import_jobs.organization_id', 'import_jobs.id']),)
+def AuthSession(token_hash: str, user_id: str, organization_id: str, expires_at, token_version: int = 1) -> ModelDict:
+    return ModelDict({
+        '_id': token_hash,
+        'token_hash': token_hash,
+        'user_id': user_id,
+        'organization_id': organization_id,
+        'expires_at': expires_at,
+        'created_at': now(),
+        'token_version': token_version
+    })
 
 
-class AuditLog(Base):
-    __tablename__ = 'audit_logs'
-    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uid)
-    organization_id: Mapped[str] = mapped_column(ForeignKey('organizations.id'), index=True)
-    actor_id: Mapped[str | None] = mapped_column(ForeignKey('users.id'), nullable=True)
-    action: Mapped[str] = mapped_column(String(80))
-    target: Mapped[str] = mapped_column(String(160))
-    created_at: Mapped[object] = mapped_column(DateTime(timezone=True), default=now)
+def ImportJob(organization_id: str, uploaded_by: str, filename: str, rows, counts: dict, id: str = None) -> ModelDict:
+    item_id = id or uid()
+    return ModelDict({
+        '_id': item_id,
+        'id': item_id,
+        'organization_id': organization_id,
+        'uploaded_by': uploaded_by,
+        'filename': filename,
+        'status': 'pending',
+        'rows': rows,
+        'counts': counts,
+        'created_at': now()
+    })
+
+
+def ImportErrorRow(organization_id: str, import_job_id: str, row_number: int, error_code: str, message: str, id: str = None) -> ModelDict:
+    item_id = id or uid()
+    return ModelDict({
+        '_id': item_id,
+        'id': item_id,
+        'organization_id': organization_id,
+        'import_job_id': import_job_id,
+        'row_number': row_number,
+        'error_code': error_code,
+        'message': message
+    })
+
+
+def AuditLog(organization_id: str, actor_id: str, action: str, target: str, id: str = None) -> ModelDict:
+    item_id = id or uid()
+    return ModelDict({
+        '_id': item_id,
+        'id': item_id,
+        'organization_id': organization_id,
+        'actor_id': actor_id,
+        'action': action,
+        'target': target,
+        'created_at': now()
+    })

@@ -8,9 +8,8 @@ from collections import defaultdict, deque
 from datetime import timedelta, timezone
 
 from fastapi import Depends, HTTPException, Request
-from sqlalchemy import select
 from .db import get_db, now
-from .models import AuthSession, Membership, Organization, User
+from .models import AuthSession, ModelDict
 
 
 def digest(value):
@@ -57,14 +56,17 @@ DUMMY_PASSWORD = hash_password(secrets.token_urlsafe(24))
 
 def new_session(db, user, organization_id):
     token = secrets.token_urlsafe(48)
-    db.add(AuthSession(
-        token_hash=digest(token),
-        user_id=user.id,
+    token_hash = digest(token)
+    user_id = user['id'] if isinstance(user, dict) else user.id
+    user_token_version = (user.get('token_version', 1) if isinstance(user, dict) else getattr(user, 'token_version', 1)) or 1
+    session_doc = AuthSession(
+        token_hash=token_hash,
+        user_id=user_id,
         organization_id=organization_id,
         expires_at=now() + timedelta(hours=12),
-        created_at=now(),
-        token_version=getattr(user, 'token_version', 1) or 1
-    ))
+        token_version=user_token_version
+    )
+    db['auth_sessions'].insert_one(session_doc)
     return token
 
 
@@ -74,13 +76,14 @@ def revoke_user_sessions(db, user_id: str):
     Deletes session records and increments user token_version so old tokens
     cannot be revived even if the account is later re-enabled.
     """
-    from sqlalchemy import delete
-    user = db.get(User, user_id)
-    if user:
-        user.token_version = (getattr(user, 'token_version', 1) or 1) + 1
-        user.sessions_revoked_at = now()
-    db.execute(delete(AuthSession).where(AuthSession.user_id == user_id))
-    db.flush()
+    db['users'].update_one(
+        {'$or': [{'_id': user_id}, {'id': user_id}]},
+        {
+            '$inc': {'token_version': 1},
+            '$set': {'sessions_revoked_at': now()}
+        }
+    )
+    db['auth_sessions'].delete_many({'user_id': user_id})
 
 
 def is_trusted_origin(origin: str | None) -> bool:
@@ -123,26 +126,39 @@ def context(request: Request, db=Depends(get_db)):
     token = request.cookies.get('timely_session')
     if not token:
         raise HTTPException(401, 'Sign in to continue')
-    session = db.get(AuthSession, digest(token))
-    if not session or session.expires_at.replace(tzinfo=timezone.utc) <= now():
+    token_hash = digest(token)
+    session = db['auth_sessions'].find_one({'$or': [{'_id': token_hash}, {'token_hash': token_hash}]})
+    if not session:
+        raise HTTPException(401, 'Sign in to continue')
+    expires_at = session.get('expires_at')
+    if expires_at and expires_at.replace(tzinfo=timezone.utc) <= now():
         raise HTTPException(401, 'Session expired')
-    user = db.get(User, session.user_id)
-    member = db.get(Membership, (session.organization_id, session.user_id))
-    org = db.get(Organization, session.organization_id)
-    if not user or not user.is_active or not member or member.status != 'active' or not org or org.status != 'active':
+
+    user_id = session.get('user_id')
+    org_id = session.get('organization_id')
+
+    user = db['users'].find_one({'$or': [{'_id': user_id}, {'id': user_id}]})
+    mem_id = f"{org_id}:{user_id}"
+    member = db['memberships'].find_one({'$or': [{'_id': mem_id}, {'organization_id': org_id, 'user_id': user_id}]})
+    org = db['organizations'].find_one({'$or': [{'_id': org_id}, {'id': org_id}]})
+
+    if not user or not user.get('is_active') or not member or member.get('status') != 'active' or not org or org.get('status') != 'active':
         raise HTTPException(403, 'Organization access is inactive')
+
     # S5 – Session revocation and token versioning checks
-    sess_version = getattr(session, 'token_version', 1) or 1
-    user_version = getattr(user, 'token_version', 1) or 1
+    sess_version = session.get('token_version', 1) or 1
+    user_version = user.get('token_version', 1) or 1
     if sess_version != user_version:
         raise HTTPException(401, 'Session has been revoked')
-    revoked_at = getattr(user, 'sessions_revoked_at', None)
-    sess_created = getattr(session, 'created_at', None)
+
+    revoked_at = user.get('sessions_revoked_at')
+    sess_created = session.get('created_at')
     if revoked_at and sess_created:
         rev_dt = revoked_at if revoked_at.tzinfo else revoked_at.replace(tzinfo=timezone.utc)
         crt_dt = sess_created if sess_created.tzinfo else sess_created.replace(tzinfo=timezone.utc)
         if crt_dt <= rev_dt:
             raise HTTPException(401, 'Session has been revoked')
+
     if request.method not in ('GET', 'HEAD', 'OPTIONS'):
         referer = request.headers.get('referer', '')
         is_swagger = '/docs' in referer or '/redoc' in referer
@@ -152,7 +168,16 @@ def context(request: Request, db=Depends(get_db)):
             origin = request.headers.get('origin')
             if not is_trusted_origin(origin):
                 raise HTTPException(403, 'Untrusted origin')
-    return {'organization_id': org.id, 'user_id': user.id, 'role': member.role, 'user': user, 'organization': org}
+
+    user_obj = ModelDict(user)
+    org_obj = ModelDict(org)
+    return {
+        'organization_id': org_obj.id,
+        'user_id': user_obj.id,
+        'role': member.get('role', 'viewer'),
+        'user': user_obj,
+        'organization': org_obj
+    }
 
 
 def writer(ctx=Depends(context)):
