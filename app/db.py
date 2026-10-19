@@ -6,16 +6,15 @@ from pymongo import MongoClient, ASCENDING, DESCENDING
 
 load_dotenv()
 
-MONGO_URI = os.getenv('MONGO_URI', '')
+DEFAULT_MONGO_URI = 'mongodb+srv://saquiba:saquiba123@cluster0.hrgeeif.mongodb.net/attendanceDB?retryWrites=true&w=majority&appName=attendance'
+MONGO_URI = os.getenv('MONGO_URI') or DEFAULT_MONGO_URI
 
 _client = None
 
 def get_mongo_client():
     global _client
     if _client is None:
-        if not MONGO_URI:
-            raise RuntimeError("MONGO_URI environment variable is not set. Set MONGO_URI in your .env file.")
-        _client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=5000)
+        _client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=8000)
     return _client
 
 def get_crm_db():

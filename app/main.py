@@ -59,22 +59,28 @@ from .services import activity, audit, check_assignee, create_lead, scoped, seri
 app = FastAPI(title='Timely CRM', version='1.0.0')
 
 # CORS: exact origin allowlist only; no wildcard regex. Configure FRONTEND_ORIGIN in env.
-_CORS_ORIGINS = [
-    o.strip().rstrip('/') for o in
-    os.getenv('FRONTEND_ORIGIN', 'http://localhost:3000,http://127.0.0.1:3000').split(',')
-    if o.strip() and o.strip() != '*'
-]
+_CORS_ORIGINS = {
+    'http://localhost:3000',
+    'http://127.0.0.1:3000',
+    'https://crmbackend.iryax.com',
+    'http://crmbackend.iryax.com',
+}
+for o in os.getenv('FRONTEND_ORIGIN', '').split(','):
+    clean = o.strip().rstrip('/')
+    if clean and clean != '*':
+        _CORS_ORIGINS.add(clean)
+
 if os.getenv('APP_ENV') != 'production':
-    _CORS_ORIGINS.extend([
+    _CORS_ORIGINS.update([
         'http://192.168.1.103:3000',
-        'http://127.0.0.1:3000',
     ])
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=_CORS_ORIGINS,
+    allow_origins=list(_CORS_ORIGINS),
     allow_credentials=True,
     allow_methods=['GET', 'POST', 'PATCH', 'DELETE', 'OPTIONS'],
-    allow_headers=['Content-Type', 'X-Timely-Request', 'X-Api-Key'],
+    allow_headers=['Content-Type', 'X-Timely-Request', 'X-Api-Key', 'Idempotency-Key', 'Authorization'],
 )
 
 
