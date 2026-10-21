@@ -1055,7 +1055,15 @@ def dashboard(website_id: str = '', source: str = '', assigned_to: str = '', dat
         'lead_id': {'$in': lead_ids}
     }
     tasks = list(db['follow_ups'].find(task_query))
-    dates = [(t['due_at'].replace(tzinfo=timezone.utc) if t['due_at'].tzinfo else t['due_at']) for t in tasks if t.get('due_at')]
+    dates = []
+    for t in tasks:
+        val = t.get('due_at')
+        if val:
+            if getattr(val, 'tzinfo', None) is None:
+                val = val.replace(tzinfo=timezone.utc)
+            else:
+                val = val.astimezone(timezone.utc)
+            dates.append(val)
 
     sources = {s: sum(l.get('source') == s for l in rows) for s in ['manual', 'website', 'csv', 'xlsx']}
     sites = list(db['websites'].find({'organization_id': ctx['organization_id']}))

@@ -131,8 +131,10 @@ def context(request: Request, db=Depends(get_db)):
     if not session:
         raise HTTPException(401, 'Sign in to continue')
     expires_at = session.get('expires_at')
-    if expires_at and expires_at.replace(tzinfo=timezone.utc) <= now():
-        raise HTTPException(401, 'Session expired')
+    if expires_at:
+        exp_dt = expires_at if expires_at.tzinfo else expires_at.replace(tzinfo=timezone.utc)
+        if exp_dt <= now():
+            raise HTTPException(401, 'Session expired')
 
     user_id = session.get('user_id')
     org_id = session.get('organization_id')
