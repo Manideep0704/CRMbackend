@@ -316,13 +316,6 @@ def sync_sales_agents_from_mongo():
                     {'$set': {'status': 'inactive'}}
                 )
 
-        # Update non-sales users currently marked as agent to viewer
-        members = list(db_crm['memberships'].find({'organization_id': org_id, 'role': 'agent'}))
-        for m in members:
-            u = db_crm['users'].find_one({'$or': [{'_id': m['user_id']}, {'id': m['user_id']}]})
-            if u and u.get('email') not in active_sales_emails:
-                db_crm['memberships'].update_one({'_id': m['_id']}, {'$set': {'role': 'viewer'}})
-
         print(f"[Sales Sync] Synced {len(active_sales_emails)} ACTIVE Sales Department agents to MongoDB crmDB.")
         return len(active_sales_emails)
     except Exception as e:

@@ -31,8 +31,20 @@ def check_assignee(db, org, user_id):
                 {'organization_id': org, 'user_id': user_id}
             ]
         })
-        if not member or member.get('status') != 'active' or member.get('role') == 'viewer':
+        if not member:
+            user = db['users'].find_one({'$or': [{'_id': user_id}, {'id': user_id}]})
+            if user:
+                db['memberships'].update_one(
+                    {'_id': mem_id},
+                    {'$set': {'_id': mem_id, 'id': mem_id, 'organization_id': org, 'user_id': user_id, 'role': 'agent', 'status': 'active'}},
+                    upsert=True
+                )
+                return
             raise HTTPException(422, 'Choose an active agent or administrator in this organization')
+        if member.get('status') != 'active':
+            db['memberships'].update_one({'_id': member['_id']}, {'$set': {'status': 'active'}})
+        if member.get('role') == 'viewer':
+            db['memberships'].update_one({'_id': member['_id']}, {'$set': {'role': 'agent'}})
 
 
 def duplicate(db, org, data, exclude=None):

@@ -37,6 +37,7 @@ from .schemas import (
     LeadInput,
     Login,
     MembershipInput,
+    MemberUpdate,
     MergeInput,
     NoteInput,
     WebsiteInput,
@@ -438,6 +439,48 @@ def add_member(payload: MembershipInput, ctx=Depends(admin), db=Depends(get_db))
     return serialize(user)
 
 
+@app.patch('/api/v1/members/{user_id}')
+def update_member_role(user_id: str, payload: MemberUpdate, ctx=Depends(context), db=Depends(get_db)):
+    is_admin = ctx['role'] == 'admin'
+    is_self = ctx['user_id'] == user_id
+    if not is_admin and not is_self:
+        raise HTTPException(403, 'Administrator access required')
+
+    mem_id = f"{ctx['organization_id']}:{user_id}"
+    membership = db['memberships'].find_one({
+        '$or': [{'_id': mem_id}, {'organization_id': ctx['organization_id'], 'user_id': user_id}]
+    })
+    if not membership:
+        raise HTTPException(404, 'Member not found in this organization')
+    user = db['users'].find_one({'$or': [{'_id': user_id}, {'id': user_id}]})
+    if not user:
+        raise HTTPException(404, 'User not found')
+
+    user_updates = {}
+    if payload.name is not None and is_admin:
+        user_updates['name'] = payload.name
+    if payload.email is not None and is_admin:
+        existing = db['users'].find_one({'email': payload.email, '_id': {'$ne': user['_id']}, 'id': {'$ne': user['id']}})
+        if existing:
+            raise HTTPException(409, 'Email is already in use by another account')
+        user_updates['email'] = payload.email
+    if user_updates:
+        db['users'].update_one({'_id': user['_id']}, {'$set': user_updates})
+
+    if payload.role is not None:
+        if not is_admin:
+            raise HTTPException(403, 'Only administrators can update member roles')
+        db['memberships'].update_one({'_id': membership['_id']}, {'$set': {'role': payload.role}})
+
+    updated_user = db['users'].find_one({'_id': user['_id']})
+    updated_mem = db['memberships'].find_one({'_id': membership['_id']})
+    return {
+        **serialize(updated_user),
+        'role': updated_mem.get('role', 'agent'),
+        'membership_status': updated_mem.get('status', 'active')
+    }
+
+
 @app.get('/api/v1/websites')
 def websites(ctx=Depends(context), db=Depends(get_db)):
     sites = list(db['websites'].find({'organization_id': ctx['organization_id']}).sort('created_at', 1))
@@ -529,7 +572,14 @@ def build_lead_filter(ctx, q='', status='', website_id='', source='', assigned_t
     if source:
         query['source'] = source
     if assigned_to:
-        query['assigned_to'] = assigned_to
+        if assigned_to == 'unassigned':
+            query['$or'] = [
+                {'assigned_to': None},
+                {'assigned_to': ''},
+                {'assigned_to': {'$exists': False}}
+            ]
+        else:
+            query['assigned_to'] = assigned_to
 
     date_filter = {}
     if date_from:
@@ -776,6 +826,62 @@ def edit_lead(lead_id: str, payload: dict, ctx=Depends(writer), db=Depends(get_d
         if lead.accepted_by and ctx['role'] != 'admin':
             raise HTTPException(403, 'Once a lead has been accepted, it can only be diverted or reassigned on the Admin side.')
 
+    # Fast-path for quick agent assignment / reassignment by Admin
+    if set(payload.keys()) == {'assigned_to'}:
+        new_assignee = payload['assigned_to'] or None
+        if new_assignee:
+            check_assignee(db, ctx['organization_id'], new_assignee)
+            assigned_user = db['users'].find_one({'$or': [{'_id': new_assignee}, {'id': new_assignee}]})
+            agent_name = assigned_user.get('name') if assigned_user else 'Agent'
+            action_desc = f'Assigned to {agent_name} by administrator' if not lead.accepted_by else f'Reassigned to {agent_name} by administrator'
+            set_doc = {
+                'assigned_to': new_assignee,
+                'accepted_by': new_assignee,
+                'updated_at': now()
+            }
+            if not lead.accepted_at:
+                set_doc['accepted_at'] = now()
+            if lead.status == 'new':
+                set_doc['status'] = 'contacted'
+                if lead.external_submission_id:
+                    try:
+                        from .mongo import update_lead_in_mongo
+                        update_lead_in_mongo(lead.external_submission_id, 'contacted')
+                    except Exception:
+                        pass
+            db['leads'].update_one({'$or': [{'_id': lead_id}, {'id': lead_id}]}, {'$set': set_doc})
+            activity(db, ctx['organization_id'], lead.id, ctx['user_id'], 'updated', action_desc)
+            audit(db, ctx, 'lead.assigned', lead.id)
+        else:
+            db['leads'].update_one(
+                {'$or': [{'_id': lead_id}, {'id': lead_id}]},
+                {'$set': {'assigned_to': None, 'accepted_by': None, 'updated_at': now()}}
+            )
+            activity(db, ctx['organization_id'], lead.id, ctx['user_id'], 'updated', 'Unassigned agent by administrator')
+            audit(db, ctx, 'lead.unassigned', lead.id)
+        updated = db['leads'].find_one({'$or': [{'_id': lead_id}, {'id': lead_id}]})
+        return serialize(updated)
+
+    # Fast-path for quick pipeline stage moves
+    if set(payload.keys()) == {'status'}:
+        new_status = payload['status']
+        if new_status not in ('new', 'contacted', 'qualified', 'converted', 'lost'):
+            raise HTTPException(422, 'Invalid status')
+        if lead.status != new_status:
+            db['leads'].update_one(
+                {'$or': [{'_id': lead_id}, {'id': lead_id}]},
+                {'$set': {'status': new_status, 'updated_at': now()}}
+            )
+            activity(db, ctx['organization_id'], lead.id, ctx['user_id'], 'updated', f'Stage moved to {new_status}')
+            if lead.external_submission_id:
+                try:
+                    from .mongo import update_lead_in_mongo
+                    update_lead_in_mongo(lead.external_submission_id, new_status)
+                except Exception:
+                    pass
+        updated = db['leads'].find_one({'$or': [{'_id': lead_id}, {'id': lead_id}]})
+        return serialize(updated)
+
     values = {key: getattr(lead, key) for key in LeadInput.model_fields}
     if values.get('next_follow_up_at') and values['next_follow_up_at'].tzinfo is None:
         values['next_follow_up_at'] = values['next_follow_up_at'].replace(tzinfo=timezone.utc)
@@ -793,6 +899,15 @@ def edit_lead(lead_id: str, payload: dict, ctx=Depends(writer), db=Depends(get_d
             set_fields[key] = value
 
     if changed:
+        if 'assigned_to' in changed:
+            if data.assigned_to:
+                set_fields['accepted_by'] = data.assigned_to
+                if not lead.accepted_at:
+                    set_fields['accepted_at'] = now()
+                if set_fields.get('status', lead.status) == 'new':
+                    set_fields['status'] = 'contacted'
+            else:
+                set_fields['accepted_by'] = None
         set_fields['updated_at'] = now()
         db['leads'].update_one({'$or': [{'_id': lead_id}, {'id': lead_id}]}, {'$set': set_fields})
         activity(db, ctx['organization_id'], lead.id, ctx['user_id'], 'updated', 'Updated: ' + ', '.join(changed))
@@ -1108,3 +1223,21 @@ def dashboard(website_id: str = '', source: str = '', assigned_to: str = '', dat
 def audit_logs(ctx=Depends(admin), db=Depends(get_db)):
     logs = list(db['audit_logs'].find({'organization_id': ctx['organization_id']}).sort('created_at', -1).limit(100))
     return [serialize(a) for a in logs]
+
+
+@app.delete('/api/v1/audit-logs')
+def clear_audit_logs(ctx=Depends(admin), db=Depends(get_db)):
+    db['audit_logs'].delete_many({'organization_id': ctx['organization_id']})
+    return {'ok': True, 'message': 'All audit logs cleared'}
+
+
+@app.delete('/api/v1/audit-logs/{log_id}')
+def delete_audit_log(log_id: str, ctx=Depends(admin), db=Depends(get_db)):
+    db['audit_logs'].delete_one({
+        '$and': [
+            {'$or': [{'_id': log_id}, {'id': log_id}]},
+            {'organization_id': ctx['organization_id']}
+        ]
+    })
+    return {'ok': True}
+

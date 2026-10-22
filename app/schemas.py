@@ -135,3 +135,20 @@ class MembershipInput(StrictModel):
 
 class MergeInput(StrictModel):
     target_id: str
+
+
+class MemberUpdate(StrictModel):
+    name: str | None = Field(default=None, min_length=1, max_length=160)
+    email: str | None = Field(default=None, min_length=3, max_length=254)
+    role: Literal['admin', 'agent', 'viewer'] | None = None
+
+    @field_validator('email')
+    @classmethod
+    def valid_email(cls, value):
+        if value is None:
+            return None
+        return LeadInput.normalize_email(value)
+
+
+MemberRoleUpdate = MemberUpdate
+
