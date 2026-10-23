@@ -139,10 +139,8 @@ def authenticate_attendance_user(identifier: str, password: str):
             emp_dept = str(emp.get('department', '')).lower()
             if any(k in emp_role for k in ['admin', 'director', 'general manager']):
                 crm_role = 'admin'
-            elif 'sales' in emp_dept:
-                crm_role = 'agent'
             else:
-                crm_role = 'viewer'
+                crm_role = 'agent'
             return {
                 '_id': str(emp.get('_id', '')),
                 'email': (emp.get('email') or f'{ident}@timelyhealth.in').lower(),
@@ -164,13 +162,11 @@ def authenticate_attendance_user(identifier: str, password: str):
             if empl_status != 'active':
                 print(f"[MongoDB Auth] Empl {empl.get('name')} is inactive in attendanceDB. Denying login.")
                 return None
-            empl_dept = str(empl.get('department', '')).lower()
-            crm_role = 'agent' if 'sales' in empl_dept else 'viewer'
             return {
                 '_id': str(empl.get('_id', '')),
                 'email': (empl.get('email') or f'{ident}@timelyhealth.in').lower(),
                 'name': empl.get('name') or 'Employee',
-                'role': crm_role,
+                'role': 'agent',
                 'status': empl_status,
                 'entitled_org_slug': 'timely-health'
             }

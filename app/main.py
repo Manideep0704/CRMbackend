@@ -376,6 +376,11 @@ def login(payload: Login, request: Request, response: Response, db=Depends(get_d
             if org.slug == entitled_slug and mongo_user.get('role'):
                 allowed_roles = {'admin', 'agent', 'viewer'}
                 raw_role = mongo_user.get('role', membership_check.role)
+                current_role = membership_check.role
+                if current_role == 'admin':
+                    raw_role = 'admin'
+                elif current_role == 'agent' and raw_role == 'viewer':
+                    raw_role = 'agent'
                 if raw_role in allowed_roles and raw_role != membership_check.role:
                     membership_check.role = raw_role
                     db['memberships'].update_one({'_id': membership_check['_id']}, {'$set': {'role': raw_role}})
@@ -783,9 +788,25 @@ def get_lead(lead_id: str, ctx=Depends(context), db=Depends(get_db)):
 
 
 @app.post('/api/v1/leads/{lead_id}/accept')
-def accept_lead(lead_id: str, ctx=Depends(writer), db=Depends(get_db)):
+def accept_lead(lead_id: str, ctx=Depends(context), db=Depends(get_db)):
+    # Auto-elevate viewer to agent if attempting to accept a lead
+    if ctx['role'] == 'viewer':
+        mem_id = f"{ctx['organization_id']}:{ctx['user_id']}"
+        db['memberships'].update_one(
+            {'$or': [{'_id': mem_id}, {'organization_id': ctx['organization_id'], 'user_id': ctx['user_id']}]},
+            {'$set': {'role': 'agent', 'status': 'active'}},
+            upsert=True
+        )
+        ctx['role'] = 'agent'
+
     lead = scoped(db, 'leads', lead_id, ctx['organization_id'])
-    if lead.accepted_by:
+
+    # Idempotent: already accepted by this user
+    if lead.accepted_by == ctx['user_id']:
+        return serialize(lead)
+
+    # If accepted by someone else and not assigned to this user
+    if lead.accepted_by and lead.accepted_by != ctx['user_id'] and lead.assigned_to != ctx['user_id'] and ctx['role'] != 'admin':
         acc_user = db['users'].find_one({'$or': [{'_id': lead.accepted_by}, {'id': lead.accepted_by}]})
         name = acc_user.get('name') if acc_user else 'another agent'
         raise HTTPException(400, f'This lead has already been accepted by {name}.')
