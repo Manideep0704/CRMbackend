@@ -3,13 +3,11 @@ import re
 import secrets as _sec
 from datetime import datetime, timezone
 
-from .db import get_attendance_db, get_crm_db, uid
+from .db import MONGO_URI, get_attendance_db, get_crm_db, uid
 from .models import Membership, ModelDict, User
 from .schemas import LeadInput
 from .security import hash_password, revoke_user_sessions
 from .services import create_lead
-
-MONGO_URI = os.getenv('MONGO_URI', '')
 
 
 def get_mongo_db():

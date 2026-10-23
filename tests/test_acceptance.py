@@ -214,6 +214,92 @@ def test_timezone_offsets_are_normalized_for_local_and_postgres_storage(clients)
     client = clients['admin']
     lead = create(client, next_follow_up_at='2026-10-20T10:00:00+05:30')
     saved = client.get(ROOT + f"/leads/{lead['id']}").json()
-    assert saved['next_follow_up_at'] == '2026-10-20T04:30:00+00:00'
+    assert client.get(ROOT + f"/leads/{lead['id']}").json()['next_follow_up_at'] == '2026-10-20T04:30:00+00:00'
     assert client.get(ROOT + '/follow-ups').json()[0]['due_at'] == '2026-10-20T04:30:00+00:00'
     assert client.get(ROOT + '/leads', params={'date_from': '2026-10-20T10:00:00'}).status_code == 422
+
+
+def test_add_second_followup_naive_aware_comparison(clients):
+    client = clients['admin']
+    lead = create(client, next_follow_up_at='2026-10-20T10:00:00+05:30')
+    res = client.post(ROOT + '/follow-ups', json={
+        'lead_id': lead['id'],
+        'title': 'Second Follow-up',
+        'due_at': '2026-10-22T10:00:00+05:30'
+    })
+    assert res.status_code == 201, res.text
+
+
+def test_sync_next_follow_up_with_naive_and_aware_dates(setup):
+    factory, ids = setup
+    with factory() as db:
+        from app.models import FollowUp, Lead
+        from app.services import sync_next_follow_up
+        from datetime import datetime, timezone
+        
+        org_id = ids['a']
+        lead = Lead(organization_id=org_id, full_name='Test Lead', source='manual')
+        db.add(lead)
+        db.flush()
+        
+        # 1. Add naive datetime follow-up
+        fu_naive = FollowUp(
+            organization_id=org_id,
+            lead_id=lead.id,
+            title='Naive task',
+            due_at=datetime(2026, 10, 25, 10, 0),
+            status='open'
+        )
+        # 2. Add aware datetime follow-up
+        fu_aware = FollowUp(
+            organization_id=org_id,
+            lead_id=lead.id,
+            title='Aware task',
+            due_at=datetime(2026, 10, 24, 10, 0, tzinfo=timezone.utc),
+            status='open'
+        )
+        db.add_all([fu_naive, fu_aware])
+        db.flush()
+        
+        # Must not raise TypeError: can't compare offset-naive and offset-aware datetimes
+        sync_next_follow_up(db, org_id, lead.id)
+        assert lead.next_follow_up_at is not None
+        assert lead.next_follow_up_at.tzinfo is not None
+        assert lead.next_follow_up_at == datetime(2026, 10, 24, 10, 0, tzinfo=timezone.utc)
+
+
+def test_update_member_name_email_and_role(clients):
+    admin_client = clients['admin']
+    # Create a member
+    create_res = admin_client.post(ROOT + '/members', json={
+        'name': 'Original Name',
+        'email': 'original.agent@timelyhealth.in',
+        'password': 'strong-password-1234',
+        'role': 'agent'
+    })
+    assert create_res.status_code == 201, create_res.text
+    user_id = create_res.json()['id']
+
+    # Update name and email
+    update_res = admin_client.patch(ROOT + f'/members/{user_id}', json={
+        'name': 'Updated Name',
+        'email': 'updated.agent@timelyhealth.in'
+    })
+    assert update_res.status_code == 200, update_res.text
+    data = update_res.json()
+    assert data['name'] == 'Updated Name'
+    assert data['email'] == 'updated.agent@timelyhealth.in'
+    assert data['role'] == 'agent'
+
+    # Update role
+    role_res = admin_client.patch(ROOT + f'/members/{user_id}', json={
+        'role': 'viewer'
+    })
+    assert role_res.status_code == 200
+    assert role_res.json()['role'] == 'viewer'
+
+    # Duplicate email should be rejected with 409
+    dup_res = admin_client.patch(ROOT + f'/members/{user_id}', json={
+        'email': 'admin@test.in'
+    })
+    assert dup_res.status_code == 409

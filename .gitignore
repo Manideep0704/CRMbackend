@@ -22,10 +22,9 @@ wheels/
 .installed.cfg
 *.egg
 
-
-
+.env
+.env.*
+!.env.example
 timely.db
-*.db
-*.sqlite
 *.sqlite3
 .pytest_cache/
