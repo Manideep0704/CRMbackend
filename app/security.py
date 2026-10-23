@@ -102,8 +102,12 @@ def is_trusted_origin(origin: str | None) -> bool:
         item = item.strip().rstrip('/')
         if item and item != '*':
             trusted.add(item)
-    # Always trust API host domains (for Swagger UI /docs)
+    # Always trust API and deployed frontend host domains
     trusted.update({
+        'https://crmfrontend.iryax.com',
+        'http://crmfrontend.iryax.com',
+        'http://62.72.29.27:3081',
+        'https://62.72.29.27:3081',
         'https://crmbackend.iryax.com',
         'http://crmbackend.iryax.com',
         'http://62.72.29.27:8010',

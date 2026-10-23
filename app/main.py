@@ -63,8 +63,14 @@ app = FastAPI(title='Timely CRM', version='1.0.0')
 _CORS_ORIGINS = {
     'http://localhost:3000',
     'http://127.0.0.1:3000',
+    'https://crmfrontend.iryax.com',
+    'http://crmfrontend.iryax.com',
+    'http://62.72.29.27:3081',
+    'https://62.72.29.27:3081',
     'https://crmbackend.iryax.com',
     'http://crmbackend.iryax.com',
+    'http://62.72.29.27:8010',
+    'https://62.72.29.27:8010',
 }
 for o in os.getenv('FRONTEND_ORIGIN', '').split(','):
     clean = o.strip().rstrip('/')
