@@ -8,7 +8,7 @@ services:
     environment:
       - APP_ENV=production
       - MONGO_URI=${MONGO_URI:-mongodb+srv://saquiba:saquiba123@cluster0.hrgeeif.mongodb.net/attendanceDB?retryWrites=true&w=majority&appName=attendance}
-      - FRONTEND_ORIGIN=${FRONTEND_ORIGIN:-http://localhost:3000,http://127.0.0.1:3000,https://crmbackend.iryax.com}
+      - FRONTEND_ORIGIN=${FRONTEND_ORIGIN:-https://crmfrontend.iryax.com,http://crmfrontend.iryax.com,http://62.72.29.27:3081,https://62.72.29.27:3081,http://localhost:3000,http://127.0.0.1:3000,https://crmbackend.iryax.com}
       - ADMIN_EMAIL=${ADMIN_EMAIL:-admin@timelyhealth.in}
       - ADMIN_PASS=${ADMIN_PASS:-TimelyAdmin@2026}
       - DOMAIN=${DOMAIN:-digital.timelyhealth.in}
