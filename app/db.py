@@ -6,34 +6,60 @@ from pymongo import MongoClient, ASCENDING, DESCENDING
 
 load_dotenv()
 
-DEFAULT_MONGO_URI = 'mongodb+srv://saquiba:saquiba123@cluster0.hrgeeif.mongodb.net/attendanceDB?retryWrites=true&w=majority&appName=attendance'
-MONGO_URI = os.getenv('MONGO_URI') or DEFAULT_MONGO_URI
+# Data storage MongoDB URI (Cluster for CRM data)
+DEFAULT_CRM_MONGO_URI = 'mongodb+srv://Iryax:Iryax12345@cluster0.goizuxk.mongodb.net/crmDB?retryWrites=true&w=majority'
+CRM_MONGO_URI = os.getenv('CRM_MONGO_URI') or os.getenv('MONGO_URI') or DEFAULT_CRM_MONGO_URI
+MONGO_URI = CRM_MONGO_URI
 
-_client = None
+# Authentication / Attendance MongoDB URI (Cluster for company attendance and directory authentication)
+DEFAULT_AUTH_MONGO_URI = 'mongodb+srv://saquiba:saquiba123@cluster0.hrgeeif.mongodb.net/attendanceDB?retryWrites=true&w=majority&appName=attendance'
+AUTH_MONGO_URI = os.getenv('AUTH_MONGO_URI') or os.getenv('ATTENDANCE_MONGO_URI') or DEFAULT_AUTH_MONGO_URI
+
+_crm_client = None
+_auth_client = None
+
+
+def get_crm_mongo_client():
+    global _crm_client
+    if _crm_client is None:
+        _crm_client = MongoClient(CRM_MONGO_URI, serverSelectionTimeoutMS=8000)
+    return _crm_client
+
+
+def get_auth_mongo_client():
+    global _auth_client
+    if _auth_client is None:
+        _auth_client = MongoClient(AUTH_MONGO_URI, serverSelectionTimeoutMS=8000)
+    return _auth_client
+
 
 def get_mongo_client():
-    global _client
-    if _client is None:
-        _client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=8000)
-    return _client
+    """Default client for CRM data operations."""
+    return get_crm_mongo_client()
+
 
 def get_crm_db():
-    client = get_mongo_client()
+    client = get_crm_mongo_client()
     return client['crmDB']
 
+
 def get_attendance_db():
-    client = get_mongo_client()
+    client = get_auth_mongo_client()
     return client['attendanceDB']
+
 
 def get_db():
     """FastAPI dependency for accessing CRM MongoDB database."""
     return get_crm_db()
 
+
 def now():
     return datetime.now(timezone.utc)
 
+
 def uid():
     return str(uuid4())
+
 
 def init_mongo_indexes():
     """Creates indexes on CRM collections for performance and uniqueness."""

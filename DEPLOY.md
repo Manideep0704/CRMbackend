@@ -7,7 +7,7 @@ This backend runs on FastAPI and connects directly to **MongoDB Atlas (`crmDB`)*
 ## Prerequisites
 
 - **Python 3.12+** OR **Docker & Docker Compose**
-- Network access to MongoDB Atlas (`cluster0.hrgeeif.mongodb.net`)
+- Network access to MongoDB Atlas (`cluster0.goizuxk.mongodb.net` for CRM data and `cluster0.hrgeeif.mongodb.net` for attendance SSO)
 - Domain reverse proxy (Nginx, Traefik, Caddy, Cloudflare, etc.) routing to port `8010`
 
 ---

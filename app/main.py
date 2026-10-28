@@ -247,25 +247,35 @@ def root():
 
 @app.get('/health')
 def health(db=Depends(get_db)):
-    db.command('ping')
-    from .mongo import get_attendance_db, MONGO_URI
-    mongo_configured = bool(MONGO_URI)
-    mongo_connected = False
-    if mongo_configured:
+    crm_connected = False
+    try:
+        db.command('ping')
+        crm_connected = True
+    except Exception:
+        crm_connected = False
+
+    from .mongo import AUTH_MONGO_URI, CRM_MONGO_URI, MONGO_URI, get_attendance_db
+    auth_configured = bool(AUTH_MONGO_URI)
+    auth_connected = False
+    if auth_configured:
         try:
             att_db = get_attendance_db()
             if att_db is not None:
                 att_db.command('ping')
-                mongo_connected = True
+                auth_connected = True
         except Exception:
-            mongo_connected = False
+            auth_connected = False
     return {
-        'status': 'ok',
+        'status': 'ok' if crm_connected else 'degraded',
         'service': 'Timely CRM',
         'database': 'MongoDB Atlas (crmDB)',
+        'data_storage': {
+            'configured': bool(CRM_MONGO_URI),
+            'connected': crm_connected
+        },
         'attendance_directory': {
-            'configured': mongo_configured,
-            'connected': mongo_connected
+            'configured': auth_configured,
+            'connected': auth_connected
         }
     }
 

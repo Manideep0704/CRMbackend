@@ -3,7 +3,7 @@ import re
 import secrets as _sec
 from datetime import datetime, timezone
 
-from .db import MONGO_URI, get_attendance_db, get_crm_db, uid
+from .db import AUTH_MONGO_URI, CRM_MONGO_URI, MONGO_URI, get_attendance_db, get_crm_db, uid
 from .models import Membership, ModelDict, User
 from .schemas import LeadInput
 from .security import hash_password, revoke_user_sessions
